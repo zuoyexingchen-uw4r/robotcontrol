@@ -118,3 +118,32 @@ python host/rs_selftest.py
 > 第一屏「图传启停」直接读这份记忆配置。改协议需同步 Android 与 `host/*.py`。
 > Kotlin 侧 `ReedSolomon.parityMatrix` 与 Python 侧 `video_host.cauchyRow` 是同一公式，
 > 交叉验证（JVM 实跑 vs Python）逐字节一致。
+
+## 视觉指令协议（车载视觉决策 → 下位机）
+
+视觉管线决策经 USB（OTG-CH343）直连下位机发送，**独立于主协议**
+（主协议 0xA5 0x5A + CRC16 用于遥测/心跳/底盘）。视觉指令用专用帧头，
+下位机按帧头第二字节区分命令类型。待与电控核对后可并入主协议。
+
+### 开火指令（FireController，帧头 0xFA 0xAF）
+
+| 字段 | 长度 | 说明 |
+|---|---|---|
+| HEAD | 2 | 0xFA 0xAF |
+| yaw | 2 | 枪管目标偏航角（i16，0.01°，右为正） |
+| pitch | 2 | 枪管目标俯仰角（i16，0.01°，含弹道补偿，上为正） |
+| rpm | 2 | 摩擦轮目标转速（u16 RPM） |
+| fire | 1 | 0=不击发 1=击发 |
+| XOR | 1 | 前 9 字节异或 |
+
+### 导航速度指令（Navigation，帧头 0xFA 0xBF，占位）
+
+| 字段 | 长度 | 说明 |
+|---|---|---|
+| HEAD | 2 | 0xFA 0xBF |
+| linear | 2 | 线速度（i16，mm/s，前为正） |
+| angular | 2 | 角速度（i16，mrad/s，左转为正） |
+| XOR | 1 | 前 6 字节异或 |
+
+> 发送条件：USB 通道 Connected 才发（WLAN 降级不发，开火延迟敏感）。
+> 序列化实现：`FireController.serialize()` / `Navigation.serialize()`。
