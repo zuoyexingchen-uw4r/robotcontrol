@@ -3,7 +3,27 @@
 本文档记录 RobotControl（狼牙视觉）的版本变更。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased] — 2026-10-19
+## [Unreleased] — 2026-10-20
+
+### 新增（开火下发 + 检测叠加 UI）
+
+- **开火指令串口下发**：`MainViewModel.sendVisionCommand()` 经 USB
+  （OTG-CH343）直连下位机发送 FireController 序列化帧；WLAN 降级时不发
+  （开火延迟敏感不走网络）
+- **本地预览 + 检测叠加**：主界面新增预览区（SurfaceView），
+  `VisionOverlayView` 绘制检测框（绿=高地靶/红=基地靶）、追踪框（黄，
+  含速度矢量）、准星 + 开火容差圈、开火状态文本
+- 图传启动时自动接入预览 Surface（surface 有效时）
+
+### 已知限制
+
+- 目标物理尺寸（高地靶面板 120mm、基地靶 150mm）为估值，需实机标定
+- 相机内参按典型广角 hFov=65° 估算，精确值需棋盘格标定
+- 红外雷达数据未接入，FireController 的雷达融合分支待启用
+- 开火指令帧格式（0xFA 0xAF）为视觉专用子协议，需与电控核对后
+  并入主协议（0xA5 0x5A + CRC16）
+
+## [0.4.0] — 2026-10-19（车载视觉决策转型）
 
 ### 新增（车载视觉决策转型）
 

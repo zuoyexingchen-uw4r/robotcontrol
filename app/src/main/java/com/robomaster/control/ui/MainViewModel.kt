@@ -82,6 +82,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.powerControl(port, on) }
     }
 
+    /**
+     * 视觉开火/导航指令下发（直连下位机）。
+     *
+     * 车载视觉决策的执行通道：必须走 USB（OTG-CH343），WLAN 降级时不发
+     * （开火指令延迟敏感，不走网络）。帧格式见 FireController.serialize。
+     */
+    fun sendVisionCommand(bytes: ByteArray) {
+        viewModelScope.launch {
+            if (usb.state.value is ConnState.Connected) {
+                usb.send(bytes)
+            }
+        }
+    }
+
     /** 紧急停止：立即发 ESTOP，同时摇杆清零 */
     fun eStop() {
         viewModelScope.launch {

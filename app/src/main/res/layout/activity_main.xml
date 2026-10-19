@@ -87,6 +87,25 @@
             android:orientation="vertical"
             android:paddingEnd="6dp">
 
+            <!-- 相机预览 + 视觉检测叠加（图传运行时显示） -->
+            <FrameLayout
+                android:id="@+id/previewContainer"
+                android:layout_width="match_parent"
+                android:layout_height="170dp"
+                android:background="#000000"
+                android:paddingBottom="4dp">
+
+                <SurfaceView
+                    android:id="@+id/svPreview"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+                <com.robomaster.control.vision.VisionOverlayView
+                    android:id="@+id/visionOverlay"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+            </FrameLayout>
+
             <!-- 图传一键启停 + CH343 状态 -->
             <LinearLayout
                 android:layout_width="match_parent"

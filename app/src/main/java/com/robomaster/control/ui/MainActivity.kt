@@ -174,7 +174,7 @@ class MainActivity : AppCompatActivity() {
 
         // 视觉管线：任一视觉开关开启时创建帧源（ImageReader 接入相机会话）
         val vs = VisionSettings.get(this)
-        var cfgWithVision: CameraStreamer.Config? = null
+        var finalCfg = cfg
         val visionOn = vs.deblurEnabled || vs.smoothingEnabled || vs.deglareEnabled ||
                 vs.highlandTargetEnabled || vs.baseTargetEnabled || vs.trackingEnabled ||
                 vs.autoFireEnabled || vs.navigationEnabled
@@ -182,6 +182,8 @@ class MainActivity : AppCompatActivity() {
             visionPipeline = VisionPipeline(vs)
             visionSource = VisionFrameSource(s.resW, s.resH, visionPipeline!!) { result ->
                 runOnUiThread {
+                    // 更新检测叠加视图
+                    binding.visionOverlay.update(result, s.resW, s.resH)
                     val t = result.trackedTarget
                     if (t != null) {
                         binding.tvFps.text = "FPS %.1f · %d kbps · 视觉: %s d=%dmm yaw=%.1f°".format(
@@ -191,12 +193,24 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
                     result.fireCommand?.let { fc ->
-                        if (fc.shouldFire) log("[视觉] 开火! ${fc.reason}")
+                        if (fc.shouldFire) {
+                            // 开火指令经 USB 直连下位机（帧格式见 FireController.serialize）
+                            vm.sendVisionCommand(
+                                com.robomaster.control.vision.decide.FireController.serialize(fc)
+                            )
+                            log("[视觉] 开火! ${fc.reason}")
+                        }
                     }
                 }
             }
             visionSource?.start()
-            cfg.copy(visionSurface = visionSource?.surface).let { cfgWithVision = it }
+            finalCfg = cfg.copy(visionSurface = visionSource?.surface)
+        }
+
+        // 本地预览 Surface（surface 有效才传，无效时仅推流无预览）
+        val previewSurface = binding.svPreview.holder.surface?.takeIf { it.isValid }
+        if (previewSurface != null) {
+            finalCfg = finalCfg.copy(previewSurface = previewSurface)
         }
 
         streamer = CameraStreamer(cm, lifecycleScope).apply {
@@ -205,7 +219,7 @@ class MainActivity : AppCompatActivity() {
             onLog = { msg -> runOnUiThread { toast(msg) } }
             onStats = { f, k -> runOnUiThread { binding.tvFps.text = "FPS %.1f · %d kbps".format(f, k.toInt()) } }
         }
-        streamer?.start(cfgWithVision ?: cfg)
+        streamer?.start(finalCfg)
         binding.btnVideo.text = "停止图传"
         log("[UI] 图传启动 ${s.resW}×${s.resH}@${fps} $mime FEC=${s.fec}% → ${s.host}:${s.videoPort}" +
                 if (visionOn) " + 视觉管线" else "")
