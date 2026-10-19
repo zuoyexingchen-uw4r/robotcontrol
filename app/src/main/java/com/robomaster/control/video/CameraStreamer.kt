@@ -48,6 +48,13 @@ class CameraStreamer(
         val controlPort: Int,
         val previewSurface: Surface? = null,
         /**
+         * 视觉管线帧源（ImageReader Surface，YUV_420_888）。
+         * 传入后相机会话会同时向编码器与该 Surface 输出帧，
+         * 视觉管线在 ImageReader 回调线程消费（见 VisionFrameSource）。
+         * null = 不启用视觉处理。
+         */
+        val visionSurface: Surface? = null,
+        /**
          * 空闲时补关键帧（adaptive GOP）：pacing 发现这一帧提前发完、带宽有富余时，
          * 预请求下一个采集帧编成 IDR，把空闲带宽换成更密的参考帧。
          *
@@ -258,6 +265,7 @@ class CameraStreamer(
     private fun buildSession(cd: CameraDevice, cfg: Config) {
         val targets = mutableListOf<Surface>()
         cfg.previewSurface?.let { targets += it }
+        cfg.visionSurface?.let { targets += it }
         encSurface?.let { targets += it }
         if (targets.isEmpty()) { onLog("[图传] 无输出 Surface"); return }
 

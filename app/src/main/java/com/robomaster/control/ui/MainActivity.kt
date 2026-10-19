@@ -13,6 +13,8 @@ import androidx.lifecycle.lifecycleScope
 import com.robomaster.control.databinding.ActivityMainBinding
 import com.robomaster.control.video.CameraStreamer
 import com.robomaster.control.video.EncoderMode
+import com.robomaster.control.vision.VisionFrameSource
+import com.robomaster.control.vision.VisionPipeline
 import kotlinx.coroutines.launch
 
 /**
@@ -32,6 +34,10 @@ class MainActivity : AppCompatActivity() {
 
     /** 图传发送器（本屏一键启停用） */
     private var streamer: CameraStreamer? = null
+
+    /** 视觉帧源 + 管线（图传运行时按视觉设置开关启用） */
+    private var visionSource: VisionFrameSource? = null
+    private var visionPipeline: VisionPipeline? = null
 
     /** CH343(WCH) USB 厂商 ID */
     private val wchVid = 0x1A86
@@ -166,20 +172,52 @@ class MainActivity : AppCompatActivity() {
             adaptiveKeyframe = s.adaptiveKf,
         )
 
+        // 视觉管线：任一视觉开关开启时创建帧源（ImageReader 接入相机会话）
+        val vs = VisionSettings.get(this)
+        var cfgWithVision: CameraStreamer.Config? = null
+        val visionOn = vs.deblurEnabled || vs.smoothingEnabled || vs.deglareEnabled ||
+                vs.highlandTargetEnabled || vs.baseTargetEnabled || vs.trackingEnabled ||
+                vs.autoFireEnabled || vs.navigationEnabled
+        if (visionOn) {
+            visionPipeline = VisionPipeline(vs)
+            visionSource = VisionFrameSource(s.resW, s.resH, visionPipeline!!) { result ->
+                runOnUiThread {
+                    val t = result.trackedTarget
+                    if (t != null) {
+                        binding.tvFps.text = "FPS %.1f · %d kbps · 视觉: %s d=%dmm yaw=%.1f°".format(
+                            0f, 0,  // fps/kbps 由 onStats 覆盖，这里只显示视觉行
+                            if (t.type == com.robomaster.control.vision.detect.TargetDetector.Target.Type.HIGHLAND) "高地靶" else "基地靶",
+                            t.distanceMm.toInt(), t.yawDeg
+                        )
+                    }
+                    result.fireCommand?.let { fc ->
+                        if (fc.shouldFire) log("[视觉] 开火! ${fc.reason}")
+                    }
+                }
+            }
+            visionSource?.start()
+            cfg.copy(visionSurface = visionSource?.surface).let { cfgWithVision = it }
+        }
+
         streamer = CameraStreamer(cm, lifecycleScope).apply {
             // ⚠️ onLog/onStats 可能在 IO 线程回调（CameraStreamer 在 withContext(IO) 里调用），
             // 直接 toast / 更新 UI 会抛 CalledFromWrongThread / 无 Looper 崩溃，必须切主线程。
             onLog = { msg -> runOnUiThread { toast(msg) } }
             onStats = { f, k -> runOnUiThread { binding.tvFps.text = "FPS %.1f · %d kbps".format(f, k.toInt()) } }
         }
-        streamer?.start(cfg)
+        streamer?.start(cfgWithVision ?: cfg)
         binding.btnVideo.text = "停止图传"
-        log("[UI] 图传启动 ${s.resW}×${s.resH}@${fps} $mime FEC=${s.fec}% → ${s.host}:${s.videoPort}")
+        log("[UI] 图传启动 ${s.resW}×${s.resH}@${fps} $mime FEC=${s.fec}% → ${s.host}:${s.videoPort}" +
+                if (visionOn) " + 视觉管线" else "")
     }
 
     private fun stopVideo() {
         streamer?.stop()
         streamer = null
+        visionSource?.stop()
+        visionSource = null
+        visionPipeline?.reset()
+        visionPipeline = null
         binding.btnVideo.text = "图传启停"
         binding.tvFps.text = "FPS 0.0"
         log("[UI] 图传已停止")
