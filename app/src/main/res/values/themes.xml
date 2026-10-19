@@ -1,0 +1,8 @@
+<resources>
+    <!-- 硬核深色控制台风格 -->
+    <style name="Theme.RobotControl" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">#FF101418</item>
+        <item name="android:navigationBarColor">#FF101418</item>
+        <item name="android:windowBackground">#FF101418</item>
+    </style>
+</resources>

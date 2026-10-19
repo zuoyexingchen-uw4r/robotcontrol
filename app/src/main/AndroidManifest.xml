@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- WLAN 图传 / 调试 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 摄像头硬编图传 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- BLE 备用流（API31+ 需运行时申请 CONNECT/SCAN） -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!-- 本 App 依赖 USB Host（OTG）连接 ESP32-S3 -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <application
+        android:label="@string/app_name"
+        android:theme="@style/Theme.RobotControl"
+        android:supportsRtl="true">
+
+        <!-- 插入 CH343 设备时弹出打开 App 的选择框 -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity>
+
+        <!-- 无线桥接 + 低延迟图传控制台 -->
+        <activity
+            android:name=".ui.BridgeActivity"
+            android:exported="false"
+            android:screenOrientation="landscape" />
+
+        <!-- 视觉功能设置（预处理/检测/追踪/开火/导航开关） -->
+        <activity
+            android:name=".ui.VisionSettingsActivity"
+            android:exported="false"
+            android:screenOrientation="landscape" />
+    </application>
+</manifest>

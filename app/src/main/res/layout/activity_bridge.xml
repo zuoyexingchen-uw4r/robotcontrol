@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 无线桥接 + 低延迟图传控制台：串口透传(电脑⇄CH343) 与 摄像头H.264硬编图传 -->
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0B0E12"
+    android:padding="10dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="机器人无线桥接 / 图传"
+            android:textColor="#BD93F9"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:paddingBottom="6dp" />
+
+        <!-- ══ 串口透传 ══ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="① 串口透传（OTG-CH343 ⇄ 电脑 TCP）"
+            android:textColor="#8BE9FD"
+            android:textSize="13sp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp" />
+
+        <CheckBox
+            android:id="@+id/cbForce"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="强制接管（忽略设备 ID，用通用 CDC 打开）"
+            android:textColor="#F8F8F2"
+            android:textSize="13sp"
+            android:buttonTint="#7F77DD" />
+
+        <EditText
+            android:id="@+id/etDeviceName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="指定设备名（可选，如 /dev/bus/usb/001/004；留空=首个）"
+            android:textColorHint="#6272A4"
+            android:textColor="#F8F8F2"
+            android:textSize="12sp"
+            android:inputType="text" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <EditText
+                android:id="@+id/etBaud"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="波特率"
+                android:text="115200"
+                android:textColor="#F8F8F2"
+                android:textColorHint="#6272A4"
+                android:textSize="12sp"
+                android:inputType="number" />
+
+            <EditText
+                android:id="@+id/etSerialPort"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="TCP 端口"
+                android:text="8765"
+                android:textColor="#F8F8F2"
+                android:textColorHint="#6272A4"
+                android:textSize="12sp"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="4dp">
+
+            <Button
+                android:id="@+id/btnSerialStart"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="启动桥接"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btnSerialStop"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="停止"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- ══ 第二数据流通道（预留） ══ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="③ 第二数据流（预留，数据源可插拔）"
+            android:textColor="#8BE9FD"
+            android:textSize="13sp"
+            android:paddingTop="10dp"
+            android:paddingBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="0.5"
+                android:text="端口"
+                android:textColor="#6272A4"
+                android:textSize="12sp" />
+
+            <EditText
+                android:id="@+id/etDataPort"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="数据流端口"
+                android:text="8766"
+                android:textColor="#F8F8F2"
+                android:textColorHint="#6272A4"
+                android:textSize="12sp"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="4dp">
+
+            <Button
+                android:id="@+id/btnDataStart"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="启动数据流2"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btnDataStop"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="停止"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <!-- ══ 摄像头图传 ══ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="② 摄像头图传（H.264 硬编 → 电脑，低延迟）"
+            android:textColor="#8BE9FD"
+            android:textSize="13sp"
+            android:paddingTop="10dp"
+            android:paddingBottom="4dp" />
+
+        <Spinner
+            android:id="@+id/spCamera"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Spinner
+                android:id="@+id/spRes"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1" />
+
+            <Spinner
+                android:id="@+id/spFps"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Spinner
+                android:id="@+id/spCodec"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1" />
+
+            <Spinner
+                android:id="@+id/spEnc"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1" />
+
+            <EditText
+                android:id="@+id/etFec"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="0.8"
+                android:hint="FEC %"
+                android:text="30"
+                android:textColor="#F8F8F2"
+                android:textColorHint="#6272A4"
+                android:textSize="12sp"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <CheckBox
+            android:id="@+id/cbAdaptiveKf"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="空闲时补关键帧（弱网恢复用，CBR 下会分走 P 帧码率）"
+            android:textColor="#F8F8F2"
+            android:textSize="12sp"
+            android:buttonTint="#7F77DD" />
+
+        <Spinner
+            android:id="@+id/spRepeatCsd"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:paddingBottom="2dp" />
+
+        <EditText
+            android:id="@+id/etBitrate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="码率 kbps（留空自动 = 宽×高×fps/10）"
+            android:textColor="#F8F8F2"
+            android:textColorHint="#6272A4"
+            android:textSize="12sp"
+            android:inputType="number" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <EditText
+                android:id="@+id/etHostIp"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1.4"
+                android:hint="电脑 IP"
+                android:textColorHint="#6272A4"
+                android:textColor="#F8F8F2"
+                android:textSize="12sp"
+                android:inputType="text" />
+
+            <EditText
+                android:id="@+id/etVideoPort"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="视频端口"
+                android:text="46000"
+                android:textColor="#F8F8F2"
+                android:textColorHint="#6272A4"
+                android:textSize="12sp"
+                android:inputType="number" />
+
+            <EditText
+                android:id="@+id/etCtrlPort"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="控制端口"
+                android:text="47000"
+                android:textColor="#F8F8F2"
+                android:textColorHint="#6272A4"
+                android:textSize="12sp"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingTop="4dp">
+
+            <Button
+                android:id="@+id/btnVideoStart"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="开始图传"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btnVideoStop"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="停止图传"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvStats"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="FPS 0.0 · 0 kbps"
+            android:textColor="#50FA7B"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+
+        <!-- ══ 日志 ══ -->
+        <ScrollView
+            android:id="@+id/scrollLog"
+            android:layout_width="match_parent"
+            android:layout_height="180dp"
+            android:layout_marginTop="8dp"
+            android:background="#000000">
+
+            <TextView
+                android:id="@+id/tvBridgeLog"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#6272A4"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:padding="4dp" />
+        </ScrollView>
+    </LinearLayout>
+</ScrollView>

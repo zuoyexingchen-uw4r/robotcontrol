@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- CH343 / CH340 / CH9102 系列（南京沁恒 WCH，VID 0x1A86） -->
+<resources>
+    <usb-device vendor-id="6790" product-id="30580" />  <!-- CH343: 0x1A86 / 0x55D4 -->
+    <usb-device vendor-id="6790" product-id="21795" />  <!-- CH9102: 0x1A86 / 0x5523 -->
+    <usb-device vendor-id="6790" product-id="29987" />  <!-- CH340:  0x1A86 / 0x7523 -->
+    <usb-device vendor-id="6790" />                      <!-- WCH 全系兜底 -->
+</resources>

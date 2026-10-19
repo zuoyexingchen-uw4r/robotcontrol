@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 视觉功能设置界面。
+     2026-10 新增：车载视觉决策 APP 的各功能开关。
+     布局要点：
+     - 外层 ScrollView：小屏/横屏时内容可滚动，配合 applySystemBarsInsets()
+       给根视图加系统栏 inset padding，保证所有按钮不被状态栏/导航栏遮挡。
+     - 分组卡片：每组一个标题 + 若干开关行，开关行用整行可点击（label+switch）。 -->
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#0B0E12">
+
+    <!-- ══ 顶栏：返回 + 标题 ══ -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="8dp">
+
+        <Button
+            android:id="@+id/btnBack"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="← 返回"
+            android:textSize="13sp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="视觉功能设置"
+            android:textColor="#BD93F9"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:paddingStart="8dp" />
+    </LinearLayout>
+
+    <!-- ══ 可滚动内容区 ══ -->
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:paddingBottom="16dp">
+
+            <!-- ── 图像预处理 ── -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="图像预处理"
+                android:textColor="#8BE9FD"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:paddingTop="8dp"
+                android:paddingBottom="4dp" />
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="去模糊（维纳反卷积）" />
+                <Switch android:id="@+id/swDeblur" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="图像平滑（双边滤波）" />
+                <Switch android:id="@+id/swSmoothing" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="去辉光（抗强光干扰）" />
+                <Switch android:id="@+id/swDeglare" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <!-- ── 目标检测 ── -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="目标检测"
+                android:textColor="#8BE9FD"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:paddingTop="12dp"
+                android:paddingBottom="4dp" />
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="高地靶检测（绿框标靶板）" />
+                <Switch android:id="@+id/swHighland" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="基地靶检测（红圆靶）" />
+                <Switch android:id="@+id/swBase" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <!-- 检测频率 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="检测频率（每 N 帧处理一次）"
+                    android:textColor="#F8F8F2"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/tvDetectEveryN"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="3"
+                    android:textColor="#50FA7B"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <SeekBar
+                    android:id="@+id/sbDetectEveryN"
+                    android:layout_width="120dp"
+                    android:layout_height="wrap_content"
+                    android:max="29"
+                    android:progress="2" />
+            </LinearLayout>
+
+            <!-- ── 目标追踪 ── -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="目标追踪"
+                android:textColor="#8BE9FD"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:paddingTop="12dp"
+                android:paddingBottom="4dp" />
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="卡尔曼滤波追踪（CV 模型）" />
+                <Switch android:id="@+id/swTracking" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <!-- ── 自动开火 ── -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="自动开火"
+                android:textColor="#8BE9FD"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:paddingTop="12dp"
+                android:paddingBottom="4dp" />
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="自动开火（弹道解算+摩擦轮速率）" />
+                <Switch android:id="@+id/swAutoFire" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <!-- ── 导航 ── -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="导航"
+                android:textColor="#8BE9FD"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:paddingTop="12dp"
+                android:paddingBottom="4dp" />
+
+            <LinearLayout style="@style/SettingsRow">
+                <TextView style="@style/SettingsLabel" android:text="导航（占位：待机械组完成框架）" />
+                <Switch android:id="@+id/swNavigation" style="@style/SettingsSwitch" />
+            </LinearLayout>
+
+            <!-- ── 说明 ── -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="说明：预处理与检测为本次更新核心；自动开火需接入红外雷达数据后生效；导航待机械组完成机器人框架后开工。"
+                android:textColor="#6272A4"
+                android:textSize="11sp"
+                android:paddingTop="12dp" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>
