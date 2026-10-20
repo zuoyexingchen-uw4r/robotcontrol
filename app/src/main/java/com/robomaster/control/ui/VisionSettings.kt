@@ -34,6 +34,15 @@ class VisionSettings private constructor(context: Context) {
         get() = sp.getBoolean("deglare", false)
         set(v) = sp.edit().putBoolean("deglare", v).apply()
 
+    /**
+     * V 通道 CLAHE 归一化（颜色分割前提亮暗目标）。
+     * 2026-10 公开数据集实测：暗光下不做归一化红色掩码覆盖率仅 3.9%，
+     * 开启后 55.9%。默认开启。
+     */
+    var vNormalizeEnabled: Boolean
+        get() = sp.getBoolean("v_normalize", true)
+        set(v) = sp.edit().putBoolean("v_normalize", v).apply()
+
     // ─────────── 目标检测 ───────────
 
     /** 高地靶检测（4 面板绿框标靶板） */

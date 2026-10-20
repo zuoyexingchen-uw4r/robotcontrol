@@ -5,6 +5,34 @@
 
 ## [Unreleased] — 2026-10-20
 
+### 新增（公开数据集驱动的检测管线改进，v0.5.0）
+
+基于 rmcv/armor 公开数据集（9123 张真实赛场图 / 15751 装甲板，CC-BY-4.0）
+的评测结论（详见资产 `EVAL_REPORT.md`）：真实暗光下红/蓝目标 V 掉到 0.1-0.3、
+色相偏橙，原 HSV 阈值在真实图上覆盖率仅 2.4%。
+
+- **`vision/preprocess/VNormalize.kt`（新）**：V 通道 CLAHE 归一化
+  （8×8 分块、clip=2.0×均值、CDF 映射表、块间双线性插值、RGB 按 V 等比例缩放）。
+  单一object 无 native 依赖，实测 V 提升 17.2%、H 漂移 0.4°。设置项
+  `v_normalize`（默认开）经 `VisionPipeline` 传入两个检测器
+- **`vision/detect/Hsv.kt`**：红色掩码 345-15/S≥0.40/V≥0.30 →
+  **345-40 回绕/S≥0.45/V≥0.12**（与公开数据基准配置逐项一致）；
+  新增蓝色掩码预置（195-270/S≥0.40/V≥0.15，狼牙暂无蓝目标，备用）
+- **`vision/detect/TargetDetector.kt`**：
+  - 基地靶检测增加闭运算（open → open+close）：公开数据集上断裂/带孔洞的
+    红色掩码会被圆形度判据误拒（合成断裂圆 5 碎片 → 合并为 1 圆检出）
+  - 几何分析改用 `MinAreaRect`（旋转卡壳）：轴对齐外接框把倾斜目标长边
+    估大 8-15%（实测 30° 旋转面板 60px 目标，bbox 65px vs minRect 60px）
+  - `scaledMinArea()`：最小连通域面积随分辨率缩放（640×480→30，
+    1440×1080→103），修复大图漏检远处小目标
+  - `detectHighland/detectBase` 新增 `normalizeV` 参数（默认 true）
+- **`vision/detect/Components.kt`**：Blob 增加像素列表（供最小外接矩形），
+  共享 scratch 缓冲 + ThreadLocal 复用，PIXEL_CAP=20000 防巨型连通域
+- **自测**：`SelftestDetect.kt` 11/11 → **36/36**（新增暗红圆旧阈值漏检
+  复现、阈值边缘暗红圆 CLAHE 救回、断裂圆合并、旋转面板 minAreaRect 精度、
+  minArea 缩放、CLAHE 单元、红圆场景不误检高地靶）；预处理自测 7/7 保持
+- 构建：修复仓库缺失的 gradle wrapper jar（清单补 Main-Class）
+
 ### 修复（整合合作者更新）
 
 - **RTP 时间戳 1000 倍 bug**（`GameStream.rtpTimestamp`）：`×90/1e6` 应为

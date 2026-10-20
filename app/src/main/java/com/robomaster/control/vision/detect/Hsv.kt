@@ -79,11 +79,26 @@ object Hsv {
         return mask
     }
 
-    /** 预置：高地靶绿色（荧光绿标靶板） */
+    /** 预置：高地靶绿色（荧光绿标靶板）。色相带不变，配合 VNormalize 提亮暗目标 */
     fun greenMask(rgb: ByteArray, w: Int, h: Int): ByteArray =
         colorMask(rgb, w, h, hueMin = 80f, hueMax = 160f, satMin = 0.30f, valMin = 0.20f)
 
-    /** 预置：基地靶红色（固定靶 + 移动靶） */
+    /**
+     * 预置：基地靶红色（固定靶 + 移动靶）。
+     *
+     * 2026-10 公开数据集（rmcv/armor 9123 张真实图）像素级统计修正：
+     * 真实暗光红目标的色相会偏橙到 20~40°、V 掉到 0.10~0.25，
+     * 原阈值（345-15/S>=0.40/V>=0.30）在真实图上掩码覆盖率仅 3.9%。
+     * 修正为 345-40 回绕 + S>=0.45 + V>=0.12（与公开数据基准配置逐项一致，
+     * 配合 VNormalize CLAHE，实测覆盖率 3.9% -> 57.1%，灰灭灯板误燃 0%）。
+     */
     fun redMask(rgb: ByteArray, w: Int, h: Int): ByteArray =
-        colorMask(rgb, w, h, hueMin = 345f, hueMax = 15f, satMin = 0.40f, valMin = 0.30f)
+        colorMask(rgb, w, h, hueMin = 345f, hueMax = 40f, satMin = 0.45f, valMin = 0.12f)
+
+    /**
+     * 预置：蓝色目标（公开数据集中的蓝装甲板实测 H 195-270/S>=0.40/V>=0.15）。
+     * 狼牙规则暂无蓝色目标；保留作通用 colorMask 配置与评测对照。
+     */
+    fun blueMask(rgb: ByteArray, w: Int, h: Int): ByteArray =
+        colorMask(rgb, w, h, hueMin = 195f, hueMax = 270f, satMin = 0.40f, valMin = 0.15f)
 }

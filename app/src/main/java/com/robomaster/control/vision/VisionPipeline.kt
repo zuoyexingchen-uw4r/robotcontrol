@@ -115,10 +115,10 @@ class VisionPipeline(private val settings: VisionSettings) {
         val cam = TargetDetector.CameraParams(w, h)
         val targets = ArrayList<TargetDetector.Target>()
         if (settings.highlandTargetEnabled) {
-            targets.addAll(TargetDetector.detectHighland(rgb, w, h, cam))
+            targets.addAll(TargetDetector.detectHighland(rgb, w, h, cam, normalizeV = settings.vNormalizeEnabled))
         }
         if (settings.baseTargetEnabled) {
-            targets.addAll(TargetDetector.detectBase(rgb, w, h, cam))
+            targets.addAll(TargetDetector.detectBase(rgb, w, h, cam, normalizeV = settings.vNormalizeEnabled))
         }
         val detectMs = (System.nanoTime() - tDet) / 1_000_000
 
