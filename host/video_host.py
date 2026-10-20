@@ -28,6 +28,7 @@ wire format（对照 Sunshine stream.cpp / video.h）：
   python video_host.py --host <手机IP> --vport 46000 --out stream.h265
 """
 import argparse
+import os
 import queue as _queue
 import socket
 import struct
@@ -35,6 +36,44 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
+from collections import deque
+
+# ---------- 终端输出工具 ----------
+def _disp_width(s):
+    """字符串在等宽终端里的显示列数：CJK 全角字符（次/包等）占 2 列。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def _term_cols():
+    for fd in (sys.stderr.fileno(), sys.stdout.fileno()):
+        try:
+            return os.get_terminal_size(fd).columns
+        except Exception:
+            pass
+    return 120
+
+
+def _pad_line(line):
+    """把统计行补齐到终端宽度。
+
+    统计行用 \\r 回到行首覆盖刷新，新行比旧行**短**时旧行尾部会残留在屏幕上——
+    实测表现就是 `vq=302KBKB` 这种莫名多出一截的乱码（gap= 的次数/包数位数一变，
+    行长度就变）。补齐到整行宽度，覆盖才干净。
+    """
+    pad = _term_cols() - _disp_width(line)
+    return line + " " * pad if pad > 0 else line
+
+
+def _drift_verdict(net, fd, boost):
+    """根据「净积压」和 ffplay 丢帧数给出结论，而不是永远说"没问题"。"""
+    if net > 0:
+        return (f"净积压 {net} 帧且在涨 = 播放端解不过来，延迟在漂；"
+                f"先加大 --fps-boost（当前 {boost}，试 3~4），或降码率/分辨率")
+    if fd > 0:
+        return (f"ffplay 主动丢了 {fd} 帧 = 播放节奏比送入快不少（略有快放感），"
+                f"可把 --fps-boost 从 {boost} 调小")
+    return "净积压 ≤0 且 ffplay 没丢帧 = 节奏匹配、延迟不会漂"
 
 # ---------- GF(256) Reed-Solomon 擦除解码 ----------
 PRIM = 0x11D
@@ -150,6 +189,10 @@ def main():
     ap.add_argument("--out", default="stream.h265", help="输出裸流文件名")
     ap.add_argument("--play", action="store_true", help="管道给 ffplay 实时播放")
     ap.add_argument("--kf-every", type=float, default=2.0, help="每 N 秒请求一次关键帧")
+    ap.add_argument("--fps", type=int, default=30, help="发送端帧率档位（15/24/30，需与手机端一致）")
+    ap.add_argument("--fps-boost", type=int, default=2,
+                    help="播放帧率 = --fps + 该值。留 1~2 的追赶余量，让 ffplay 永远比送入快一点，"
+                         "从根上避免内部队列积压导致的延迟漂移")
     ap.add_argument("--show-ffplay-log", action="store_true",
                     help="显示 ffplay 原始日志（默认隐藏，HEVC 解码报错会刷屏）")
     args = ap.parse_args()
@@ -159,20 +202,46 @@ def main():
     # 超时让 recvfrom 周期性返回，Ctrl+C 才能及时打断（阻塞时信号要等系统调用结束）
     udp.settimeout(0.5)
 
+    def _cl(x):
+        try:
+            x.close()
+        except Exception:
+            pass
+
     if args.play:
         # probesize 32 太小，ffplay 会报 "not enough frames to estimate rate"
         # 且起播明显变慢；32768 足够识别 SPS/PPS，又不至于拖延迟
         #
-        # stderr 用**管道**而不是 DEVNULL：ffplay 带 -stats 会往 stderr 写
-        #   frame=  600 fps= 30.0 q=28.0 size=... time=...
-        # 这个 fps/frame 是**解码器实际处理**的数字，不是我们送了多少——
-        # 退出时据此报告真实解码帧率（用来判断 ffplay 的播放节奏是否跟不上送入）。
+        # stderr 用**管道**而不是 DEVNULL：要从中解析解码统计与内部队列积压。
         # 原始行默认不打印（HEVC 一遇参考帧缺失就刷几千行），
         # 只有 --show-ffplay-log 时才回显；需要排查时再加。
+        # 播放帧率 = 档位 + boost：让 ffplay 永远比送入快 1~2fps。
+        # 实测对照：30fps 档 ffplay 按 29.8 播（比送入慢）→ 内部队列持续增长 →
+        # 延迟从几十 ms 漂到 3~5s；15fps 档它猜 25（比送入快）→ 一直小幅追赶、
+        # 完全不积压、延迟 24ms。所以正确做法不是"猜准"，而是**故意猜高一点**。
+        # ⚠️ 这里**不能**用 -r：ffplay 的选项表里没有 -r（那是 ffmpeg 专属），
+        # 实测会直接报 "Failed to set value '32' for option 'r': Option not found"
+        # 然后立刻退出 → 窗口不出来、一帧也没解码，而报错被 stderr 管道吞掉，
+        # 表面上只看到 "解码器实际输出 0.00 fps"，极难排查（2026-10-19 踩过）。
+        # 裸流（h264/hevc demuxer）的正确输入帧率选项是 **-framerate**，
+        # 它是 demuxer 的私有选项，实测生效：不指定时 ffplay 猜 25 fps，
+        # 指定 -framerate 32 后流信息就是 "32 fps"。放在 -i 前、对 pipe:0 同样有效。
+        #
+        # ⚠️⚠️ 怎么拿到"解码器实际按多少帧率解的"（**不能是复述我们送进去的值**）：
+        # ffplay 的 -stats 输出是这种格式（实测抓取）：
+        #       nan M-V:    nan fd=   0 aq=    0KB vq=    0KB sq=    0B
+        #   里面**没有** frame=/fps= ——那是 ffmpeg(命令行)的格式，ffplay 完全不同。
+        #   所以真正的解码帧数要用 **-vf showinfo**：它每解码一帧打一行
+        #       [Parsed_showinfo_0 @ 0x...] n:   0 pts: NOPTS pts_time:NOPTS ...
+        #   n 就是解码器吐出的帧序号 —— 这是解码器自己的输出，不是我们喂了多少。
+        #   vq= 同时给出 ffplay **内部视频队列积压量**，是判断延迟会不会漂的直接指标
+        #   （持续上涨 = 播放节奏跟不上送入 = 延迟累积）。
+        play_fps = args.fps + args.fps_boost
         proc = subprocess.Popen(
             ["ffplay", "-flags", "low_delay", "-fflags", "nobuffer", "-framedrop",
              "-probesize", "32768", "-analyzeduration", "0", "-stats",
-             "-window_title", "RobotControl 图传", "-i", "pipe:0"],
+             "-framerate", str(play_fps), "-vf", "showinfo",
+             "-window_title", f"RobotControl 图传 ({play_fps}fps 播放)", "-i", "pipe:0"],
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -180,23 +249,53 @@ def main():
         f = None
 
         import re as _re
-        ff_stats = {"frame": 0, "fps": 0.0}
-        _pat = _re.compile(rb"frame=\s*(\d+)\s+fps=\s*([\d.]+)")
+        # frame: showinfo 累计解码帧数（解码器自己的输出，不是我们喂了多少）
+        # vq: ffplay 内部**编码包**队列当前 KB（每秒刷新，能看趋势）；vq_max: 峰值
+        # fd: ffplay 主动丢帧累计（framedrop 丢的，越多说明播放端越跟不上）
+        ff_stats = {"frame": 0, "vq": 0, "vq_max": 0, "fd": 0, "t0": 0.0}
+        ff_err_tail = deque(maxlen=30)     # 留最近若干行，ffplay 挂掉时用来报错
+        _pat_frame = _re.compile(rb"n:\s*(\d+)\s+pts:")          # showinfo 解码帧序号
+        _pat_stat = _re.compile(rb"fd=\s*(\d+).*?vq=\s*(\d+)KB")  # ffplay 状态行
 
         def read_ff_stderr():
             try:
                 for line in iter(proc.stderr.readline, b""):
+                    ff_err_tail.append(line.decode("utf-8", "replace").rstrip())
                     if args.show_ffplay_log:
                         sys.stderr.write(line.decode("utf-8", "replace"))
-                    m = _pat.search(line)
+                    m = _pat_frame.search(line)
                     if m:
-                        ff_stats["frame"] = int(m.group(1))
-                        ff_stats["fps"] = float(m.group(2))
+                        n = int(m.group(1)) + 1
+                        if ff_stats["frame"] == 0:
+                            ff_stats["t0"] = time.time()   # 从首帧开始计时，避开起播耗时
+                        if n > ff_stats["frame"]:
+                            ff_stats["frame"] = n
+                    m = _pat_stat.search(line)
+                    if m:
+                        ff_stats["fd"] = int(m.group(1))
+                        v = int(m.group(2))
+                        ff_stats["vq"] = v              # 当前值，用于看趋势
+                        if v > ff_stats["vq_max"]:
+                            ff_stats["vq_max"] = v
             except Exception:
                 pass
 
         ff_reader = threading.Thread(target=read_ff_stderr, daemon=True)
         ff_reader.start()
+
+        # 启动自检：ffplay 若因选项/解复用问题秒退，stdin 写入会一直成功但画面永远不来。
+        # 这里先等 1.2s，进程已退出就把它最后几行 stderr 打出来，避免又盲查一轮。
+        time.sleep(1.2)
+        if proc.poll() is not None:
+            sys.stderr.write(
+                "\n[ffplay] 启动即退出（退出码 %s），播放无法进行。原始报错：\n" % proc.returncode
+            )
+            for ln in list(ff_err_tail)[-12:]:
+                sys.stderr.write("  | " + ln + "\n")
+            sys.stderr.write("[ffplay] 常见原因：选项不被 ffplay 支持（如 -r）/ 管道编码格式不匹配\n")
+            _cl(sink)
+            sys.stderr.write("[stopped]\n")
+            return
     else:
         f = open(args.out, "wb")
         sink = f
@@ -207,12 +306,10 @@ def main():
     rs_frames = {"n": 0}     # 其中靠 RS FEC 恢复出来的帧
     timeouts = {"n": 0}      # 超时未凑齐、被清理掉的帧
     bytes_acc = {"n": 0}
+    frames_total = {"n": 0}   # 累计交给 ffplay 的帧（退出时对照解码器实际解了多少）
+    bytes_total = {"n": 0}    # 累计字节，用于算平均码率
+    run_t0 = time.time()      # 整轮开始时间（t0 每秒被重置，算总时长必须用它）
     t0 = time.time()
-    def _cl(x):
-        try:
-            x.close()
-        except Exception:
-            pass
 
     # 写入独立线程：ffplay/磁盘一旦慢下来，不会反过来阻塞 UDP 收包
     # （单线程时 sink.write 卡住 → recvfrom 停 → 内核 UDP 缓冲堆积 → 延迟累积）。
@@ -268,8 +365,15 @@ def main():
     emitted = {}      # frame_index -> 已输出（防迟到包重组出幽灵帧重复输出）
     last_seq = -1
     last_cleanup = time.time()
+    last_dec = {"n": 0}        # 上一秒时 ffplay 已解码帧数，用于算 dec= 每秒增量
     max_frame_seen = -1     # 迄今见到的最大 frame_index，用于检测推流重启
     gap_cnt = {"n": 0, "pkts": 0}   # 丢包累计，按秒汇总，避免每个 gap 刷一行
+
+    # 实测帧率：用 RTP timestamp（90kHz）的帧间隔中位数反推手机端真实采集帧率。
+    # 用来验证手机是否真的按 --fps 档位在送（VFR/降帧时对不上）。
+    ts_hist = deque(maxlen=40)
+    last_ts_seen = None
+    last_fi_for_ts = None
 
     def block_complete(fb):
         """块内分片到齐（或可 FEC 恢复）→ (该块 1008B×k 字节流, 是否用了RS恢复)；失败返回 None"""
@@ -313,7 +417,9 @@ def main():
             try:
                 write_q.put_nowait(frame)
                 frames["n"] += 1
+                frames_total["n"] += 1
                 bytes_acc["n"] += len(frame)
+                bytes_total["n"] += len(frame)
             except _queue.Full:
                 pass
         for b in range(nblocks):
@@ -354,6 +460,15 @@ def main():
                 gap_cnt["n"] += 1
                 gap_cnt["pkts"] += (seq - last_seq - 1) & 0xFFFF
             last_seq = seq
+
+            # 帧切换时记一次 RTP ts，用帧间隔中位数反推真实采集帧率
+            if frame_index != last_fi_for_ts:
+                if last_ts_seen is not None:
+                    d = (ts - last_ts_seen) & 0xFFFFFFFF
+                    if 0 < d < 90000:        # 合理帧间隔 0~1s，过滤回绕/异常
+                        ts_hist.append(d)
+                last_ts_seen = ts
+                last_fi_for_ts = frame_index
 
             pkt_idx = (fec_info >> 12) & 0x3FF      # 块内分片序号
             k = (fec_info >> 22) & 0x3FF            # 块内数据分片数
@@ -417,12 +532,43 @@ def main():
                 # gap=本秒丢包次数/包数（汇总，不逐条刷）
                 gap_txt = f" gap={gap_cnt['n']}次/{gap_cnt['pkts']}包" if gap_cnt["n"] else ""
                 bp_txt = f" bp={backpressure['n']}" if backpressure["n"] else ""
-                sys.stderr.write(
+                # vq = ffplay 内部视频**包**队列当前积压（KB），实时值能看趋势：
+                # 持续上涨 = 解码/播放跟不上送入 = 延迟开始漂；稳定低位 = 节奏对了。
+                vq_txt = f" vq={ff_stats['vq']}KB" if proc is not None else ""
+                # dec = 解码器最近一秒实际解出的帧数（showinfo 累计数的每秒差值）。
+                # dec 持续 < out= 就是解码端在积压，这是"延迟会不会漂"最直接的一个数。
+                dec_txt = ""
+                if proc is not None:
+                    dec_txt = f" dec={ff_stats['frame'] - last_dec['n']}"
+                    last_dec["n"] = ff_stats["frame"]
+                # real= 手机端真实采集帧率（RTP ts 中位数反推），用来核对 --fps 档位
+                real_txt = ""
+                real_fps = 0.0
+                if len(ts_hist) >= 10:
+                    med = sorted(ts_hist)[len(ts_hist) // 2]
+                    ts_bug = False
+                    # 兼容旧 APK：发送端 rtpTimestamp 误写成 ptsUs×90/1e6（差 1000 倍），
+                    # 30fps 的帧间隔只有 3 tick 而不是 3000 → 反推出 30000fps 这种离谱值。
+                    # 帧间隔 <450 tick（即 >200fps，物理上不可能）就按 ×1000 修正并标注。
+                    if 0 < med < 450:
+                        med *= 1000
+                        ts_bug = True
+                    real_fps = 90000.0 / med if med > 0 else 0.0
+                    real_txt = f" real={real_fps:.1f}" + ("(ts修正)" if ts_bug else "")
+                line = (
                     f"\r[recv] {frames['n']/dt:5.1f} fps | {kbps:5.0f} kbps | "
                     f"out={frames['n']:3d} rs={rs_frames['n']:3d} to={timeouts['n']:3d} "
-                    f"buf={len(frames_buf):3d}{gap_txt}{bp_txt}"
+                    f"buf={len(frames_buf):3d}{gap_txt}{bp_txt}{real_txt}{vq_txt}{dec_txt}"
                 )
+                # 必须补齐到终端宽度，否则 \r 覆盖刷新时旧行尾部残留成乱码
+                # （实测：vq=302KB 变成 vq=302KBKB）
+                sys.stderr.write(_pad_line(line))
                 sys.stderr.flush()
+                if real_fps > 0 and abs(real_fps - args.fps) > 1.5:
+                    sys.stderr.write(
+                        f"\n[recv] ⚠️ 实测采集帧率 {real_fps:.1f} 与 --fps {args.fps} 偏差 >1.5，"
+                        f"播放按 {args.fps + args.fps_boost}fps 跑；若延迟仍漂，请把 --fps 改成 {round(real_fps)}"
+                    )
                 frames["n"] = 0
                 rs_frames["n"] = 0
                 timeouts["n"] = 0
@@ -431,6 +577,16 @@ def main():
                 backpressure["n"] = 0
                 bytes_acc["n"] = 0
                 t0 = time.time()
+
+                # ffplay 若已退出（解码失败/格式不匹配/窗口被关），没必要再空转：
+                # 写线程会因 BrokenPipe 退出，但主循环仍在收包并把帧计数入队，
+                # 日志会一直刷 out=/bp= 却没有画面。这里发现即停，退出报告会带上原因。
+                if proc is not None and proc.poll() is not None:
+                    sys.stderr.write(
+                        f"\n[ffplay] 已退出（退出码 {proc.returncode}），停止接收。"
+                        f"若画面刚出来就黑，看下面 ffplay 的原始报错："
+                    )
+                    break
     except KeyboardInterrupt:
         pass
     finally:
@@ -449,10 +605,41 @@ def main():
                     ff_reader.join(timeout=1.0)
                 except Exception:
                     pass
+                dur = (time.time() - ff_stats["t0"]) if ff_stats["t0"] else 0.0
+                dec_fps = ff_stats["frame"] / dur if dur > 1.0 else 0.0
+                sent = frames_total["n"]
+                send_fps = sent / dur if dur > 1.0 else 0.0
+                # 净积压 = 我们送进去的帧 − 解码器解出来的帧。
+                # >0 且持续变大 = 帧堆在 ffplay 里没解出来 = 延迟在漂；≈0/为负 = 安全。
+                # 注意 ffplay 的 KB 是 1024 进制，换算 ms 要 ×1024。
+                net = sent - ff_stats["frame"]
+                run_dur = time.time() - run_t0
+                avg_kbps = bytes_total["n"] * 8 / 1000.0 / run_dur if run_dur > 0.5 else 0.0
+                vq_ms = ff_stats["vq_max"] * 8192.0 / avg_kbps if avg_kbps > 0 else 0.0
                 sys.stderr.write(
-                    f"\n[ffplay] 解码器实际输出 {ff_stats['fps']:.2f} fps，累计解码 {ff_stats['frame']} 帧"
-                    f"（对照 out= 是接收端送给它的帧数；两者持续拉开就说明播放节奏跟不上，延迟会漂）"
+                    f"\n[ffplay] 解码器实际输出 {dec_fps:.2f} fps，累计解码 {ff_stats['frame']} 帧"
+                    f"（解码持续 {dur:.0f}s；这是 showinfo 数出来的**解码器输出**，不是我们送了多少）"
                 )
+                sys.stderr.write(
+                    f"\n[ffplay] 同段我们送出 {sent} 帧（{send_fps:.2f} fps）→ 净积压 {net} 帧"
+                    f"；净积压 >0 且在变大 = 延迟在漂，≈0 或为负 = 安全"
+                )
+                sys.stderr.write(
+                    f"\n[ffplay] ffplay 内部包队列 峰值 {ff_stats['vq_max']}KB"
+                    f"（≈{vq_ms:.0f}ms 数据量；丢包让解码器等数据时会瞬时冲高，不代表播放延迟）"
+                    f"/ 当前 {ff_stats['vq']}KB；ffplay 主动丢帧 fd={ff_stats['fd']}"
+                )
+                sys.stderr.write(
+                    f"\n[ffplay] 播放帧率设定 {args.fps + args.fps_boost}"
+                    f"（--fps {args.fps} + boost {args.fps_boost}）；"
+                    + _drift_verdict(net, ff_stats["fd"], args.fps_boost)
+                )
+                # 一帧都没解出来 = ffplay 根本没跑起来（或编码格式不匹配），
+                # 把它的原始报错打出来，否则只能看到 "0.00 fps" 无从下手。
+                if ff_stats["frame"] == 0:
+                    sys.stderr.write("\n[ffplay] 未解码任何帧，原始报错：\n")
+                    for ln in list(ff_err_tail)[-12:]:
+                        sys.stderr.write("  | " + ln + "\n")
             elif f is not None:
                 f.close()
         except Exception:

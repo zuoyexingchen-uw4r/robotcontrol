@@ -93,8 +93,15 @@ object GameStream {
     fun packMultiFecBlocks(blockNum: Int, numBlocks: Int): Int =
         ((blockNum and 0x3) shl 4) or (((numBlocks - 1) and 0x3) shl 6)
 
-    /** 90kHz RTP 时间戳 = ptsUs × 90 / 1e6 */
-    fun rtpTimestamp(ptsUs: Long): Int = ((ptsUs * 90L) / 1_000_000L).toInt()
+    /**
+     * 90kHz RTP 时间戳 = ptsUs × 90000 / 1e6
+     *
+     * ⚠️ 之前写成 ×90/1e6，整整差 1000 倍：30fps 一帧间隔 33333µs 本应得 3000 tick，
+     * 实际只得到 3 tick。上位机拿 ts 反推帧率会算出 30000fps——当时就是靠这个
+     * 离谱的数字才暴露出来的。任何按 RTP ts 做时钟/同步的客户端（Moonlight 等）
+     * 都会被这个错误带崩，必须按 90000 tick/秒 算。
+     */
+    fun rtpTimestamp(ptsUs: Long): Int = ((ptsUs * 90_000L) / 1_000_000L).toInt()
 
     /**
      * 每块最大数据分片数。FEC 块约束 k+m≤255（Cauchy 矩阵需要 k+m 个相异非零元），
