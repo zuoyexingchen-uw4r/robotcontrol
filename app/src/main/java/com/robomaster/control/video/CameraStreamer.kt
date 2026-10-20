@@ -48,12 +48,14 @@ class CameraStreamer(
         val controlPort: Int,
         val previewSurface: Surface? = null,
         /**
-         * 视觉管线帧源（ImageReader Surface，YUV_420_888）。
-         * 传入后相机会话会同时向编码器与该 Surface 输出帧，
-         * 视觉管线在 ImageReader 回调线程消费（见 VisionFrameSource）。
-         * null = 不启用视觉处理。
+         * 相机就绪回调：CameraDevice 打开后触发（图传 session 建立之前）。
+         *
+         * 视觉分析走**独立的第二条 Camera2 会话**（见 VisionCamera）：
+         * 拿到 device 后自建 CaptureSession（独立 ImageReader target +
+         * 独立帧率），与图传码流互不干扰——图传 session 只含编码器
+         * 与预览 Surface，视觉分析降帧/降分辨率都不影响推流质量。
          */
-        val visionSurface: Surface? = null,
+        val onCameraReady: ((CameraDevice) -> Unit)? = null,
         /**
          * 空闲时补关键帧（adaptive GOP）：pacing 发现这一帧提前发完、带宽有富余时，
          * 预请求下一个采集帧编成 IDR，把空闲带宽换成更密的参考帧。
@@ -246,6 +248,8 @@ class CameraStreamer(
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(cd: CameraDevice) {
                         camera = cd
+                        // 先把 device 暴露给视觉分析（建独立第二会话），再建图传 session
+                        cfg.onCameraReady?.invoke(cd)
                         buildSession(cd, cfg)
                     }
                     override fun onDisconnected(cd: CameraDevice) { cd.close(); camera = null }
@@ -263,9 +267,9 @@ class CameraStreamer(
     }
 
     private fun buildSession(cd: CameraDevice, cfg: Config) {
+        // 图传 session：只含编码器 + 预览（视觉走独立第二会话，见 onCameraReady）
         val targets = mutableListOf<Surface>()
         cfg.previewSurface?.let { targets += it }
-        cfg.visionSurface?.let { targets += it }
         encSurface?.let { targets += it }
         if (targets.isEmpty()) { onLog("[图传] 无输出 Surface"); return }
 

@@ -23,9 +23,15 @@
 ## 2. 视觉管线架构
 
 ```
-Camera2 (YUV_420_888)
+Camera2（同一 CameraDevice，两条独立会话）
    │
-   ▼
+   ├─ 会话 1（图传，CameraStreamer）：编码器 Surface + 预览 Surface
+   │     帧率/码率按推流需求配置，不受视觉影响
+   │
+   └─ 会话 2（视觉，VisionCamera）：独立 ImageReader（YUV_420_888）
+         独立帧率（默认 15fps，可低于图传减轻 CPU 负担）
+              │
+              ▼
 ┌─ 预处理（可开关） ─────────────────────────────┐
 │ 去模糊 Deblur（维纳反卷积 FFT，周期性）        │
 │ 平滑 Smoothing（双边滤波，保边去噪）           │
@@ -53,7 +59,8 @@ Camera2 (YUV_420_888)
 ```
 
 性能预算（640×480）：预处理 ~10-20ms，检测 ~15-30ms，按「每 N 帧」节流
-（默认 3），整体约 10fps 处理。
+（默认 3），整体约 10fps 处理。OpenCV 接入时替换 YUV→RGB 步骤，
+直接用 YUV 平面构造 Mat。
 
 ## 3. 目录结构
 
@@ -65,6 +72,8 @@ app/src/main/java/com/robomaster/control/
 ├── comm/                # 通信协议（帧解析 / 状态机）
 ├── vision/              # 视觉（本次新增）
 │   ├── VisionPipeline.kt      # 主管线
+│   ├── VisionCamera.kt        # 独立第二会话（ImageReader + 帧回调 + YUV→RGB）
+│   ├── VisionOverlayView.kt   # 检测结果叠加视图
 │   ├── preprocess/           # Deblur / Smoothing / Deglare
 │   ├── detect/               # Hsv / Morphology / Components / MinAreaRect / TargetDetector
 │   ├── track/                # KalmanFilterCV

@@ -5,6 +5,18 @@
 
 ## [Unreleased] — 2026-10-20
 
+### 新增（视觉独立第二码流）
+
+- **视觉分析走独立第二条 Camera2 会话**（`VisionCamera`）：
+  - 图传 session 只含编码器 + 预览 Surface，**码流完全不受视觉影响**
+  - 视觉 session 在同一 CameraDevice 上自建 CaptureSession，独立
+    ImageReader（YUV_420_888）+ 独立帧率（默认 15fps，可低于图传）
+  - 传感器输出帧按两 session 各自请求节奏分发，互不阻塞
+  - 帧回调暴露原始 YUV Image：纯 Kotlin 管线经 `yuv420ToRgb` 转 RGB；
+    OpenCV 接入时可直接用 YUV 平面构造 Mat
+- 移除旧的共享会话方案（VisionFrameSource / Config.visionSurface）
+- 停止顺序：先停视觉会话（依赖 device），再停图传（close device）
+
 ### 新增（开火下发 + 检测叠加 UI）
 
 - **开火指令串口下发**：`MainViewModel.sendVisionCommand()` 经 USB

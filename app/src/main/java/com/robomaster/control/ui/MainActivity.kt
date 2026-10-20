@@ -13,7 +13,7 @@ import androidx.lifecycle.lifecycleScope
 import com.robomaster.control.databinding.ActivityMainBinding
 import com.robomaster.control.video.CameraStreamer
 import com.robomaster.control.video.EncoderMode
-import com.robomaster.control.vision.VisionFrameSource
+import com.robomaster.control.vision.VisionCamera
 import com.robomaster.control.vision.VisionPipeline
 import kotlinx.coroutines.launch
 
@@ -35,9 +35,13 @@ class MainActivity : AppCompatActivity() {
     /** 图传发送器（本屏一键启停用） */
     private var streamer: CameraStreamer? = null
 
-    /** 视觉帧源 + 管线（图传运行时按视觉设置开关启用） */
-    private var visionSource: VisionFrameSource? = null
+    /** 视觉分析相机（独立第二会话，图传码流不受影响） */
+    private var visionCamera: VisionCamera? = null
+    private var visionThread: android.os.HandlerThread? = null
     private var visionPipeline: VisionPipeline? = null
+
+    /** 视觉分析帧率（独立于图传，低于图传帧率减轻 CPU 负担） */
+    private val visionFps = 15
 
     /** CH343(WCH) USB 厂商 ID */
     private val wchVid = 0x1A86
@@ -172,7 +176,7 @@ class MainActivity : AppCompatActivity() {
             adaptiveKeyframe = s.adaptiveKf,
         )
 
-        // 视觉管线：任一视觉开关开启时创建帧源（ImageReader 接入相机会话）
+        // 视觉管线：任一视觉开关开启时，相机就绪后建独立第二会话（VisionCamera）
         val vs = VisionSettings.get(this)
         var finalCfg = cfg
         val visionOn = vs.deblurEnabled || vs.smoothingEnabled || vs.deglareEnabled ||
@@ -180,31 +184,46 @@ class MainActivity : AppCompatActivity() {
                 vs.autoFireEnabled || vs.navigationEnabled
         if (visionOn) {
             visionPipeline = VisionPipeline(vs)
-            visionSource = VisionFrameSource(s.resW, s.resH, visionPipeline!!) { result ->
-                runOnUiThread {
-                    // 更新检测叠加视图
-                    binding.visionOverlay.update(result, s.resW, s.resH)
-                    val t = result.trackedTarget
-                    if (t != null) {
-                        binding.tvFps.text = "FPS %.1f · %d kbps · 视觉: %s d=%dmm yaw=%.1f°".format(
-                            0f, 0,  // fps/kbps 由 onStats 覆盖，这里只显示视觉行
-                            if (t.type == com.robomaster.control.vision.detect.TargetDetector.Target.Type.HIGHLAND) "高地靶" else "基地靶",
-                            t.distanceMm.toInt(), t.yawDeg
-                        )
-                    }
-                    result.fireCommand?.let { fc ->
-                        if (fc.shouldFire) {
-                            // 开火指令经 USB 直连下位机（帧格式见 FireController.serialize）
-                            vm.sendVisionCommand(
-                                com.robomaster.control.vision.decide.FireController.serialize(fc)
-                            )
-                            log("[视觉] 开火! ${fc.reason}")
+            // 视觉帧处理线程（ImageReader 回调 + YUV→RGB + 管线，CPU 密集）
+            visionThread = android.os.HandlerThread("vision-camera").also { it.start() }
+            val vHandler = android.os.Handler(visionThread!!.looper)
+            finalCfg = cfg.copy(onCameraReady = { device ->
+                visionCamera = VisionCamera(
+                    device = device,
+                    width = s.resW,
+                    height = s.resH,
+                    fps = visionFps,
+                    handler = vHandler,
+                    onFrame = { image ->
+                        // 第二会话帧：YUV→RGB → 视觉管线（OpenCV 接入时可替换此步）
+                        val rgb = VisionCamera.yuv420ToRgb(image, s.resW, s.resH)
+                        val result = visionPipeline?.process(rgb, s.resW, s.resH) ?: return@VisionCamera
+                        runOnUiThread {
+                            // 更新检测叠加视图
+                            binding.visionOverlay.update(result, s.resW, s.resH)
+                            val t = result.trackedTarget
+                            if (t != null) {
+                                binding.tvFps.text = "FPS %.1f · %d kbps · 视觉: %s d=%dmm yaw=%.1f°".format(
+                                    0f, 0,  // fps/kbps 由 onStats 覆盖，这里只显示视觉行
+                                    if (t.type == com.robomaster.control.vision.detect.TargetDetector.Target.Type.HIGHLAND) "高地靶" else "基地靶",
+                                    t.distanceMm.toInt(), t.yawDeg
+                                )
+                            }
+                            result.fireCommand?.let { fc ->
+                                if (fc.shouldFire) {
+                                    // 开火指令经 USB 直连下位机（帧格式见 FireController.serialize）
+                                    vm.sendVisionCommand(
+                                        com.robomaster.control.vision.decide.FireController.serialize(fc)
+                                    )
+                                    log("[视觉] 开火! ${fc.reason}")
+                                }
+                            }
                         }
-                    }
-                }
-            }
-            visionSource?.start()
-            finalCfg = cfg.copy(visionSurface = visionSource?.surface)
+                    },
+                    onError = { msg -> runOnUiThread { log("[视觉] $msg") } }
+                )
+                visionCamera?.start()
+            })
         }
 
         // 本地预览 Surface（surface 有效才传，无效时仅推流无预览）
@@ -226,10 +245,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopVideo() {
+        // 顺序：先停视觉第二会话（依赖 CameraDevice），再停图传（会 close device）
+        visionCamera?.stop()
+        visionCamera = null
         streamer?.stop()
         streamer = null
-        visionSource?.stop()
-        visionSource = null
+        visionThread?.quitSafely()
+        visionThread = null
         visionPipeline?.reset()
         visionPipeline = null
         binding.btnVideo.text = "图传启停"
