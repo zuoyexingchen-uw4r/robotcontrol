@@ -1,10 +1,14 @@
 package com.robomaster.control.video
 
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.CaptureRequest
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -110,6 +114,10 @@ class CameraStreamer(
     private var statWindowStart = 0L
 
     @Volatile private var running = false
+    /** PTS 时基自检：只报一次，避免刷屏 */
+    @Volatile private var warnedLatBase = false
+    /** 相机 HAL 最大在途帧数（REQUEST_PIPELINE_MAX_DEPTH），日志里对照实际深度用 */
+    @Volatile private var pipelineMaxDepth: Int? = null
 
     /** 上次「空闲补关键帧」的时刻，用于 [MIN_IDR_INTERVAL_MS] 密度节流 */
     private var lastIdrRequestMs = 0L
@@ -242,6 +250,7 @@ class CameraStreamer(
             enc.setCallback(codecCallback, handler)
             enc.start()
             onLog("[图传] 编码就绪 ${cfg.width}x${cfg.height}@${cfg.fps} ${cfg.bitrate / 1000}kbps FEC=${cfg.fecPercentage}%")
+            logCameraPipelineDepth(cfg)
 
             cameraManager.openCamera(
                 cfg.cameraId,
@@ -266,22 +275,99 @@ class CameraStreamer(
         }
     }
 
+    /**
+     * 相机 HAL 的在途帧深度——**App 侧延迟的另一半，之前完全没量化**。
+     *
+     * REQUEST_PIPELINE_MAX_DEPTH（API 28+）= 从 setRepeatingRequest 到出图之间，
+     * HAL 最多可以缓存多少帧。这个数直接就是相机侧的延迟：
+     *   深度 3 @30fps = 100ms，深度 4 = 133ms。
+     * 实测 App 侧总延迟 128ms，如果这里报 3~4，说明延迟主要在相机 HAL，
+     * 那是固件行为，软件侧能做的很有限（见 buildSession 的 ISP 低延迟设置）。
+     */
+    private fun logCameraPipelineDepth(cfg: Config) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+        runCatching {
+            val ch = cameraManager.getCameraCharacteristics(cfg.cameraId)
+            val depth = ch.get(CameraCharacteristics.REQUEST_PIPELINE_MAX_DEPTH)
+            val hw = ch.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+            if (depth != null) {
+                pipelineMaxDepth = depth.toInt()
+                val perFrameMs = 1000 / maxOf(1, cfg.fps)
+                onLog("[图传] 相机 HAL 最大在途 $depth 帧（≈${pipelineMaxDepth!! * perFrameMs}ms，硬件级别 $hw）")
+            }
+        }
+    }
+
     private fun buildSession(cd: CameraDevice, cfg: Config) {
-        // 图传 session：只含编码器 + 预览（视觉走独立第二会话，见 onCameraReady）
         val targets = mutableListOf<Surface>()
         cfg.previewSurface?.let { targets += it }
         encSurface?.let { targets += it }
         if (targets.isEmpty()) { onLog("[图传] 无输出 Surface"); return }
 
+        // **读"实际"管线深度**（不是 REQUEST_PIPELINE_MAX_DEPTH 那个上限）。
+        // CaptureResult.REQUEST_PIPELINE_DEPTH 是 HAL 每帧上报的真实深度，
+        // 官方文档：REQUEST_PIPELINE_MAX_DEPTH 只是"最多"，"the actual pipeline depth
+        // (specified by CaptureResult#REQUEST_PIPELINE_DEPTH) may be less than the max"。
+        // 深度 X 帧 = 相机侧延迟 X 个帧间隔（30fps 下 X×33ms）。
+        // 实测这台设备上限 8 帧，但实际用几帧必须读出来才知道——这是相机侧延迟的
+        // 唯一真实读数，之前完全没取。
+        var loggedDepth = -1
+        val depthCb = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult,
+            ) {
+                // ⚠️ 这个键是 **Byte** 类型（AOSP: new Key("android.request.pipelineDepth", Byte.class)），
+                // 不是 Int——直接和 Int 比较编译不过。
+                val d = result.get(CaptureResult.REQUEST_PIPELINE_DEPTH)?.toInt() ?: return
+                if (d != loggedDepth) {
+                    loggedDepth = d
+                    val perFrame = 1000 / maxOf(1, cfg.fps)
+                    onLog("[图传] 相机实际管线深度 $d 帧（≈${d * perFrame}ms，上限 ${pipelineMaxDepth ?: "?"}）")
+                }
+            }
+        }
+
         val sessionCb = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
                 session = s
-                val req = cd.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                val base = cd.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     targets.forEach { addTarget(it) }
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(cfg.fps, cfg.fps))
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                }.build()
-                s.setRepeatingRequest(req, null, handler)
+                }
+                // 低延迟 ISP 设置：NOISE_REDUCTION / EDGE / TONEMAP 的 HIGH_QUALITY
+                // 档会做**多帧融合**，每项都可能多背 1~2 帧；FAST 是逐帧处理。
+                // 视频预览/图传场景根本用不到 HIGH_QUALITY 的画质，白送几十毫秒。
+                // 视频防抖同理（多一帧的重构延迟）。
+                // ⚠️ 这些键不是所有设备都允许在会话内修改：setRepeatingRequest 会抛
+                // CameraAccessException。所以先用"全套"试，失败就退回 base，
+                // 绝不让图传因为一个画质优化起不来。
+                val lowLat = try {
+                    base.apply {
+                        set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
+                        set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
+                        set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
+                        set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                    }.build()
+                } catch (_: IllegalArgumentException) {
+                    null
+                }
+                try {
+                    val req = if (lowLat != null) lowLat else base.build()
+                    // 传 CaptureCallback 而非 null：要读**实际**管线深度，见下面 depthCb
+                    s.setRepeatingRequest(req, depthCb, handler)
+                    if (lowLat != null) {
+                        onLog("[图传] 低延迟 ISP 已应用（NR/EDGE/TONEMAP=FAST，防抖关）")
+                    } else {
+                        onLog("[图传] 设备不支援会话内改 ISP 模式，用模板默认")
+                    }
+                } catch (e: CameraAccessException) {
+                    s.setRepeatingRequest(base.build(), depthCb, handler)
+                    onLog("[图传] 低延迟 ISP 被拒（${e.message}），已回退默认设置")
+                }
                 onLog("[图传] 推流中 → ${cfg.hostIp}:${cfg.videoPort}")
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
@@ -290,8 +376,72 @@ class CameraStreamer(
         }
 
         // 旧式 createCaptureSession：全 API 兼容（28+ 已 deprecated 但仍可用，最稳）
-        @Suppress("DEPRECATION")
-        cd.createCaptureSession(targets, sessionCb, handler)
+        //
+        // ⚠️⚠️ 但先用 **Stream Use Case**（API 33+）试一把，这是本轮的核心修复：
+        // 我们一直用 TEMPLATE_RECORD，它走 VIDEO_RECORD 语义，而官方文档原话是
+        //   "VIDEO_RECORD: ... including high-quality image stabilization ...
+        //    This option might produce output frames with a **substantial lag
+        //    from real time**, to allow for highest-quality stabilization
+        //    or other processing."
+        // 实测这台设备相机 HAL 最大在途 8 帧（≈264ms @30fps），正是"高画质换延迟"的
+        // 典型症状。VIDEO_CALL 用途会让 HAL 选低延迟的 sensor mode / 调优，
+        // 关掉高画质防抖那条路径。
+        var started = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // 先问设备支持哪些 Stream Use Case，再挑最合适的——盲设 VIDEO_CALL
+            // 碰上不支持的设备会白抛一次异常。
+            // 常量名带 SCALER_AVAILABLE_ 前缀是因为 AOSP 只在这里公开了这几个值
+            // （DEFAULT=0 / PREVIEW=1 / STILL_CAPTURE=2 / VIDEO_RECORD=3 /
+            //   PREVIEW_VIDEO_STILL=4 / VIDEO_CALL=5），setStreamUseCase(long)
+            //   消费的正是这套编码。
+            val supported = runCatching {
+                cameraManager.getCameraCharacteristics(cfg.cameraId)
+                    .get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES)
+            }.getOrNull()
+            val hasVideoCall = supported?.contains(
+                CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL.toLong()) == true
+            val hasPreview = supported?.contains(
+                CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong()) == true
+            val useCase = when {
+                hasVideoCall -> CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL
+                hasPreview -> CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW
+                else -> null
+            }
+            val useCaseName = when (useCase) {
+                CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL -> "VIDEO_CALL"
+                CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW -> "PREVIEW"
+                else -> "无"
+            }
+            if (supported != null) {
+                onLog("[图传] 设备支持的 Stream Use Case = ${supported.toList()}")
+            }
+            if (useCase != null) {
+                runCatching {
+                    val outs = mutableListOf<android.hardware.camera2.params.OutputConfiguration>()
+                    cfg.previewSurface?.let {
+                        outs += android.hardware.camera2.params.OutputConfiguration(it).apply {
+                            setStreamUseCase(CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong())
+                        }
+                    }
+                    outs += android.hardware.camera2.params.OutputConfiguration(encSurface!!).apply {
+                        setStreamUseCase(useCase.toLong())
+                    }
+                    cd.createCaptureSessionByOutputConfigurations(outs, sessionCb, handler)
+                    started = true
+                    onLog("[图传] Stream Use Case = $useCaseName"
+                        + "（低延迟管线；TEMPLATE_RECORD 的 VIDEO_RECORD 语义官方明示会有 substantial lag）")
+                }.onFailure {
+                    onLog("[图传] Stream Use Case 设置失败（${it.message}），回退默认会话")
+                }
+            }
+        }
+        if (!started) {
+            @Suppress("DEPRECATION")
+            cd.createCaptureSession(targets, sessionCb, handler)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                onLog("[图传] Android < 13 无 Stream Use Case，用 TEMPLATE_RECORD 默认管线")
+            }
+        }
     }
 
     private val codecCallback = object : MediaCodec.Callback() {
@@ -302,8 +452,6 @@ class CameraStreamer(
             buf.position(info.offset)
             buf.get(bytes, 0, info.size)
             codec.releaseOutputBuffer(index, false)
-
-            val t0 = System.nanoTime()
 
             // 参数集（H.264 的 SPS/PPS；HEVC 的 VPS/SPS/PPS）缓存，拼到关键帧前，
             // 保证 PC 端拿到参数集才能起播（Sunshine 同思路）
@@ -324,7 +472,22 @@ class CameraStreamer(
             }
 
             val frameType = if (key) GameStream.FRAME_TYPE_IDR else GameStream.FRAME_TYPE_P
-            val latencyDeciMs = ((System.nanoTime() - t0) / 100_000L).toInt()
+            // 真正的"采集→此刻"延迟：MediaCodec 的 presentationTimeUs 就是相机帧时间戳
+            // （monotonic 时基，与 System.nanoTime() 可比），所以这个差值覆盖了
+            // 相机 HAL 管线 + 编码器内部缓冲 + 本次回调处理，是端到端延迟里 **App 侧**的份额。
+            // ⚠️ 之前这里测的是 `nanoTime() - t0`（t0 就在函数开头），只反映编码回调内部
+            // 耗时（微秒级），对诊断 330ms 毫无价值——App 侧一直是盲区。
+            // 单位 0.1ms、u16 上限 6553.5ms，足够覆盖异常值。
+            val encLatMs = (System.nanoTime() - info.presentationTimeUs * 1000L) / 1_000_000.0
+            val latencyDeciMs = encLatMs.coerceIn(0.0, 6553.5).let { (it * 10).toInt() }
+            // 时基自检：presentationTimeUs 理论上与 System.nanoTime() 同为 monotonic 时基
+            // （相机帧时间戳）。若某设备不是（比如 PTS 从 0 开始自己计数），算出来的值会
+            // 溢出到 6553.5ms 上限——那就必须在日志里喊一声，不能默默给你一个错数。
+            if ((encLatMs < -1.0 || encLatMs > 6553.5) && !warnedLatBase) {
+                warnedLatBase = true
+                onLog("[图传] ⚠️ PTS 时基异常：ptsUs=${info.presentationTimeUs} 与 nanoTime 不可比，"
+                    + "applat 统计不可信（encLat=${encLatMs.toLong()}ms）")
+            }
             sender?.sendFrame(payload, frameType, info.presentationTimeUs, latencyDeciMs)
 
             frameCount++; byteCount += payload.size
@@ -348,6 +511,19 @@ class CameraStreamer(
                     var all = ByteArray(0)
                     csd.forEach { all = all + it }
                     pendingCsd = all
+                }
+            }
+            // **编码器实际使用的延迟（帧）**：官方文档对 KEY_LATENCY 的原话是
+            // "Use the output format to verify that this feature was enabled and the
+            //  actual value used by the encoder"——我们必须验，不能设了就当生效。
+            // 实测 App 侧延迟 128ms（≈4 帧），如果这里报 3~4，光它就占掉 100ms+，
+            // 比继续调接收端有意义得多。报 -1 = 编码器没在 output format 里给出该值。
+            runCatching {
+                val lat = format.getInteger(MediaFormat.KEY_LATENCY, -1)
+                if (lat >= 0) {
+                    onLog("[图传] 编码器实际延迟 $lat 帧（KEY_LATENCY 生效，${lat * 1000 / maxOf(1, currentCfg?.fps ?: 30)}ms）")
+                } else {
+                    onLog("[图传] 编码器未报告 latency（不支持或未启用 KEY_LATENCY）")
                 }
             }
         }

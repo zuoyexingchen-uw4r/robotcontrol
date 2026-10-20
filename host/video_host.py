@@ -65,15 +65,24 @@ def _pad_line(line):
     return line + " " * pad if pad > 0 else line
 
 
-def _drift_verdict(net, fd, boost):
-    """根据「净积压」和 ffplay 丢帧数给出结论，而不是永远说"没问题"。"""
-    if net > 0:
-        return (f"净积压 {net} 帧且在涨 = 播放端解不过来，延迟在漂；"
+def _drift_verdict(net, dur, fd, boost):
+    """按「净积压速率」判断，而不是看绝对帧数。
+
+    绝对帧数会把 ffplay 起播探测期的正常滞后误判成漂移：30fps 下 1.3s 启动就是
+    40 帧，看着吓人其实一秒就播完了。所以判据取**每秒净增帧数**，
+    >0.3 帧/s 才算真在漂。
+    """
+    rate = net / dur if dur > 0 else 0.0
+    fd_rate = fd / dur if dur > 0 else 0.0
+    if rate > 0.3:
+        return (f"净积压 {net} 帧（每秒净增 {rate:.2f} 帧）= 播放端解不过来，延迟在漂；"
                 f"先加大 --fps-boost（当前 {boost}，试 3~4），或降码率/分辨率")
-    if fd > 0:
-        return (f"ffplay 主动丢了 {fd} 帧 = 播放节奏比送入快不少（略有快放感），"
+    # fd 也要按速率看：59s 丢 1 帧是噪声，不能拿来建议调参数（boost=0 时也无处可调）
+    if fd_rate > 0.1:
+        return (f"ffplay 主动丢了 {fd} 帧（{fd_rate:.2f} 帧/s）= 播放节奏比送入快不少（略有快放感），"
                 f"可把 --fps-boost 从 {boost} 调小")
-    return "净积压 ≤0 且 ffplay 没丢帧 = 节奏匹配、延迟不会漂"
+    return (f"净积压 {net} 帧（每秒净增 {rate:+.2f} 帧）、ffplay 丢帧 {fd} 个 "
+            f"= 节奏匹配、延迟不会漂")
 
 # ---------- GF(256) Reed-Solomon 擦除解码 ----------
 PRIM = 0x11D
@@ -193,12 +202,25 @@ def main():
     ap.add_argument("--fps-boost", type=int, default=2,
                     help="播放帧率 = --fps + 该值。留 1~2 的追赶余量，让 ffplay 永远比送入快一点，"
                          "从根上避免内部队列积压导致的延迟漂移")
+    ap.add_argument("--write-q", type=int, default=3,
+                    help="接收端写队列容量（帧）。这个队列每帧 = 1/fps 秒的纯延迟，"
+                         "容量 8 时最坏白背 266ms@30fps；默认 3（≈100ms）"
+                         "且队列满时丢最旧帧——用户取向是「丢帧保延迟」")
     ap.add_argument("--show-ffplay-log", action="store_true",
                     help="显示 ffplay 原始日志（默认隐藏，HEVC 解码报错会刷屏）")
     args = ap.parse_args()
 
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("0.0.0.0", args.vport))
+    # 内核 UDP 接收缓冲：Windows 默认只有 64KB，而**一帧就是 ~100KB 突发**
+    # （30fps@5.7Mbps ≈ 100 包/帧，帧内全速发完）。缓冲装不下一个突发帧，
+    # 超出的包直接丢 → 日志里 gap=1~26次/秒 就是这么来的。
+    # 注意：这**不增加延迟**——我们收到就立刻消费，大缓冲只是不让内核丢包。
+    # （memory 里记的是桌面版加过，工作区版一直漏掉，本轮补上）
+    try:
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+    except Exception:
+        pass
     # 超时让 recvfrom 周期性返回，Ctrl+C 才能及时打断（阻塞时信号要等系统调用结束）
     udp.settimeout(0.5)
 
@@ -207,6 +229,25 @@ def main():
             x.close()
         except Exception:
             pass
+
+    # 累计计数器必须定义在 ffplay 块**之前**：ffplay 的 stderr 读线程要在
+    # "解出首帧"时快照 frames_total，而那时 play 块早已执行完。
+    frames_total = {"n": 0}   # 累计交给 ffplay 的帧（退出时对照解码器实际解了多少）
+    bytes_total = {"n": 0}    # 累计字节，用于算平均码率
+    run_t0 = time.time()      # 整轮开始时间（t0 每秒被重置，算总时长必须用它）
+
+    # 关键帧请求：事件驱动。置位即让 ctrl() 立刻发 SS_RFI_REQUEST。
+    # 三个触发源（都对应"解码器即将/已经花屏"）：
+    #   ① 帧组装超时被清理（缺的分片永远等不到 = 这一帧废了）
+    #   ② ffplay 报解码错误（no frame! / Could not find ref / non-existing PPS）
+    #   ③ 一秒内丢包数超阈值（突发丢包，很可能打中正在传的 IDR）
+    # 为什么要它：IDR 丢失后解码器没有参考帧，画面会冻结到**下一个 IDR**
+    # （I_FRAME_INTERVAL=2 秒）——用户实测的"突发 1s 卡顿"就是这个。
+    # 按需请求能把恢复时间从最多 2s 压到约 1 帧。
+    # 这正是 Moonlight 的做法（见 _ref/moonlight-qt-master/app/streaming/video/ffmpeg.cpp
+    # 注释："Report decoding errors to allow us to request a key frame"）。
+    need_idr = threading.Event()
+    idr_stat = {"periodic": 0, "ondemand": 0, "fferr": 0}
 
     if args.play:
         # probesize 32 太小，ffplay 会报 "not enough frames to estimate rate"
@@ -250,12 +291,20 @@ def main():
 
         import re as _re
         # frame: showinfo 累计解码帧数（解码器自己的输出，不是我们喂了多少）
+        # sent0: 解出首帧那一刻我们已送出的帧数——净积压必须以此为原点，
+        #        否则 ffplay 起播探测那 1~2s（我们已在写管道、它还没解码）
+        #        会被误算成积压（实测 boost=0 时凭空多出 40 帧 ≈ 1.3s）。
         # vq: ffplay 内部**编码包**队列当前 KB（每秒刷新，能看趋势）；vq_max: 峰值
         # fd: ffplay 主动丢帧累计（framedrop 丢的，越多说明播放端越跟不上）
-        ff_stats = {"frame": 0, "vq": 0, "vq_max": 0, "fd": 0, "t0": 0.0}
+        ff_stats = {"frame": 0, "vq": 0, "vq_max": 0, "fd": 0, "t0": 0.0, "sent0": 0}
         ff_err_tail = deque(maxlen=30)     # 留最近若干行，ffplay 挂掉时用来报错
         _pat_frame = _re.compile(rb"n:\s*(\d+)\s+pts:")          # showinfo 解码帧序号
         _pat_stat = _re.compile(rb"fd=\s*(\d+).*?vq=\s*(\d+)KB")  # ffplay 状态行
+        # 解码错误 = 参考链断了（丢帧/丢 IDR 的必然结果）。Moonlight 靠这个请求关键帧，
+        # 我们照做。注意 HEVC 下这类报错很密集，靠 ctrl() 的 0.3s 限流防 IDR 风暴。
+        _pat_err = _re.compile(
+            rb"no frame!|Could not find ref|First slice|non-existing PPS"
+            rb"|reference picture|no reference frame|Invalid slice")
 
         def read_ff_stderr():
             try:
@@ -267,7 +316,9 @@ def main():
                     if m:
                         n = int(m.group(1)) + 1
                         if ff_stats["frame"] == 0:
-                            ff_stats["t0"] = time.time()   # 从首帧开始计时，避开起播耗时
+                            # 从首帧开始计时，避开起播耗时；同时快照已送出帧数作原点
+                            ff_stats["t0"] = time.time()
+                            ff_stats["sent0"] = frames_total["n"]
                         if n > ff_stats["frame"]:
                             ff_stats["frame"] = n
                     m = _pat_stat.search(line)
@@ -277,6 +328,10 @@ def main():
                         ff_stats["vq"] = v              # 当前值，用于看趋势
                         if v > ff_stats["vq_max"]:
                             ff_stats["vq_max"] = v
+                    if _pat_err.search(line):
+                        # 解码器在喊"参考帧没了"——立刻要一个 IDR 把参考链重建起来
+                        idr_stat["fferr"] += 1
+                        need_idr.set()
             except Exception:
                 pass
 
@@ -306,15 +361,18 @@ def main():
     rs_frames = {"n": 0}     # 其中靠 RS FEC 恢复出来的帧
     timeouts = {"n": 0}      # 超时未凑齐、被清理掉的帧
     bytes_acc = {"n": 0}
-    frames_total = {"n": 0}   # 累计交给 ffplay 的帧（退出时对照解码器实际解了多少）
-    bytes_total = {"n": 0}    # 累计字节，用于算平均码率
-    run_t0 = time.time()      # 整轮开始时间（t0 每秒被重置，算总时长必须用它）
+    # App 侧延迟（短帧头里的 0.1ms 值）：采集→送出，覆盖相机 HAL + 编码器缓冲。
+    # 与 PC 侧的 q=/vq= 合起来才能把端到端延迟拆开——之前 App 侧完全是盲区。
+    app_lat = {"sum": 0, "n": 0, "max": 0, "tsum": 0, "tn": 0}
     t0 = time.time()
 
     # 写入独立线程：ffplay/磁盘一旦慢下来，不会反过来阻塞 UDP 收包
     # （单线程时 sink.write 卡住 → recvfrom 停 → 内核 UDP 缓冲堆积 → 延迟累积）。
-    # 队列很小（8 帧）且满时丢最旧——旧帧到播放端本就过期，保低延迟优先。
-    write_q = _queue.Queue(maxsize=8)
+    # 队列很小且满时丢最旧——旧帧到播放端本就过期，保低延迟优先。
+    # ⚠️ 容量就是**纯延迟预算**：每帧 1/fps 秒。曾经默认 8，30fps 下最坏白背 266ms，
+    # 而 bp= 只在"满到丢帧"时才非 0，队列稳定停在 4~5 帧时完全不报警——
+    # 用户实测 330ms 延迟，这 266ms 的队列是最大单一嫌疑。故默认降到 3 并暴露 q= 深度。
+    write_q = _queue.Queue(maxsize=max(1, args.write_q))
     backpressure = {"n": 0}   # 因队列满被丢弃的帧数
 
     def writer():
@@ -333,7 +391,13 @@ def main():
 
     def ctrl():
         """关键帧请求通道：**电脑开端口监听，手机连上来**（2026-10 协议方向反转，
-        旧版是电脑连手机）。连上后按 --kf-every 周期发 SS_RFI_REQUEST 请求 IDR。"""
+        旧版是电脑连手机）。
+
+        **事件驱动**而非固定周期：平时靠 --kf-every 周期兜底，一旦
+        need_idr 被置位（帧组装失败 / ffplay 报解码错误 / 突发丢包）就立刻发。
+        为什么：IDR 一丢，解码器画面冻结到下一个 IDR（I_FRAME_INTERVAL=2 秒），
+        用户看到的就是"突发 1s 卡顿"；按需请求把恢复时间压到约 1 帧。
+        """
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -346,11 +410,34 @@ def main():
                 except socket.timeout:
                     continue
                 cs.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sys.stderr.write(f"\n[ctrl] 手机已连接 {addr[0]}:{addr[1]}（每 {args.kf_every}s 请求关键帧）")
+                sys.stderr.write(f"\n[ctrl] 手机已连接 {addr[0]}:{addr[1]}"
+                                 f"（周期 {args.kf_every}s 兜底 + 按需立即请求）")
+                last_kf = 0.0
                 try:
                     while not stop.is_set():
+                        # 事件或周期超时唤醒；被事件唤醒时 wait 立即返回
+                        need_idr.wait(timeout=args.kf_every)
+                        if stop.is_set():
+                            break
+                        on_demand = need_idr.is_set()
+                        now = time.time()
+                        if now - last_kf < 0.3:
+                            # 限流：丢帧风暴会连着触发，IDR 太密反而挤掉 P 帧预算
+                            # （CBR 下 IDR 是 P 帧 3~10 倍大）。睡到解禁再发，
+                            # 不清事件——触发原因依然有效。
+                            time.sleep(max(0.0, 0.3 - (now - last_kf)))
+                            continue
                         cs.sendall(struct.pack(">I", 0x0301))  # SS_RFI_REQUEST → 请求 IDR
-                        time.sleep(args.kf_every)
+                        need_idr.clear()
+                        last_kf = time.time()
+                        if on_demand:
+                            idr_stat["ondemand"] += 1
+                            sys.stderr.write(
+                                f"\n[ctrl] 按需请求关键帧（累计 {idr_stat['ondemand']} 次，"
+                                f"ffplay 解码报错 {idr_stat['fferr']} 次）"
+                            )
+                        else:
+                            idr_stat["periodic"] += 1
                 except Exception:
                     pass
                 finally:
@@ -403,10 +490,18 @@ def main():
         if len(stream) < 8:
             return False
         last_len = struct.unpack_from("<H", stream, 4)[0]
+        # 短帧头 [1:3] = App 侧延迟，0.1ms 单位、小端（相机 HAL + 编码器缓冲份额）
+        app_lat_deci = struct.unpack_from("<H", stream, 1)[0]
         total_k = sum(frames_buf[(frame_index, b)]["k"] for b in range(nblocks))
         end = (total_k - 1) * PAYLOAD_BLOCK + last_len
         frame = stream[8:end] if end > 8 else b""
         if frame:
+            app_lat["sum"] += app_lat_deci
+            app_lat["n"] += 1
+            app_lat["tsum"] += app_lat_deci
+            app_lat["tn"] += 1
+            if app_lat_deci > app_lat["max"]:
+                app_lat["max"] = app_lat_deci
             # 低延迟：入队交给写入线程；队列满则丢最旧的旧帧
             if write_q.full():
                 try:
@@ -519,6 +614,9 @@ def main():
                     if now_t - frames_buf[key].get("t0", now_t) > 1.0:
                         frames_buf.pop(key, None)
                         timeouts["n"] += 1
+                        # 帧组装失败 = 这一帧永远补不齐了。若它是 IDR，
+                        # 解码器会花屏到下一个 IDR（最多 2s）——立刻要一个新的。
+                        need_idr.set()
                 # 兜底：极端情况内存仍膨胀时，丢最老的
                 if len(frames_buf) > 256:
                     for key in list(frames_buf.keys())[:64]:
@@ -555,10 +653,18 @@ def main():
                         ts_bug = True
                     real_fps = 90000.0 / med if med > 0 else 0.0
                     real_txt = f" real={real_fps:.1f}" + ("(ts修正)" if ts_bug else "")
+                # q= 写队列当前深度（帧）。**这就是 PC 侧白背的延迟**：每帧 1/fps 秒。
+                #   bp=0 不代表队列是空的——只代表没满到丢帧。实测 330ms 延迟时，
+                #   队列稳定停在 4~5 帧（130~166ms）而 bp 全程为 0，极易漏判。
+                # applat= App 侧延迟均值（ms）：采集→送出，覆盖相机 HAL + 编码器缓冲。
+                app_txt = ""
+                if app_lat["n"]:
+                    app_txt = f" applat={app_lat['sum'] / app_lat['n'] / 10:.1f}"
                 line = (
                     f"\r[recv] {frames['n']/dt:5.1f} fps | {kbps:5.0f} kbps | "
                     f"out={frames['n']:3d} rs={rs_frames['n']:3d} to={timeouts['n']:3d} "
                     f"buf={len(frames_buf):3d}{gap_txt}{bp_txt}{real_txt}{vq_txt}{dec_txt}"
+                    f" q={write_q.qsize()}/{args.write_q}{app_txt}"
                 )
                 # 必须补齐到终端宽度，否则 \r 覆盖刷新时旧行尾部残留成乱码
                 # （实测：vq=302KB 变成 vq=302KBKB）
@@ -569,6 +675,10 @@ def main():
                         f"\n[recv] ⚠️ 实测采集帧率 {real_fps:.1f} 与 --fps {args.fps} 偏差 >1.5，"
                         f"播放按 {args.fps + args.fps_boost}fps 跑；若延迟仍漂，请把 --fps 改成 {round(real_fps)}"
                     )
+                # 突发丢包也要关键帧：一秒内丢超过 20 包，很可能正打在 IDR 上
+                # （IDR 是 P 帧 3~10 倍大，分片最多，最容易被burst打缺）。
+                if gap_cnt["pkts"] >= 20:
+                    need_idr.set()
                 frames["n"] = 0
                 rs_frames["n"] = 0
                 timeouts["n"] = 0
@@ -576,6 +686,8 @@ def main():
                 gap_cnt["pkts"] = 0
                 backpressure["n"] = 0
                 bytes_acc["n"] = 0
+                app_lat["sum"] = 0
+                app_lat["n"] = 0
                 t0 = time.time()
 
                 # ffplay 若已退出（解码失败/格式不匹配/窗口被关），没必要再空转：
@@ -596,9 +708,14 @@ def main():
                 # 先关 stdin 让 ffplay 自然退出；3 秒不退就 kill，
                 # 否则 Ctrl+C 后 ffplay 窗口/进程会残留，下次起播会抢不到窗口
                 _cl(sink)
+                # 等 stderr 读线程把最后的统计行吃完，再报告**解码器实际**帧率。
+                # ⚠️ 这里必须捕获 KeyboardInterrupt：用户等不及会连按 Ctrl+C，
+                # proc.wait 里再收到一次就会抛出来、绕过 except Exception
+                # （KeyboardInterrupt 是 BaseException 不是 Exception），
+                # 最后在退出报告前面打一大坨 traceback（2026-10-20 实测出现过）。
                 try:
                     proc.wait(timeout=3)
-                except Exception:
+                except BaseException:
                     proc.kill()
                 # 等 stderr 读线程把最后的统计行吃完，再报告**解码器实际**帧率
                 try:
@@ -607,11 +724,14 @@ def main():
                     pass
                 dur = (time.time() - ff_stats["t0"]) if ff_stats["t0"] else 0.0
                 dec_fps = ff_stats["frame"] / dur if dur > 1.0 else 0.0
-                sent = frames_total["n"]
-                send_fps = sent / dur if dur > 1.0 else 0.0
-                # 净积压 = 我们送进去的帧 − 解码器解出来的帧。
+                # 净积压 = 首帧解码之后送出的帧 − 解码器解出的帧。
+                # **必须同原点**：ffplay 起播探测那 1~2s 我们已在写管道、它还没解码，
+                # 把那段时间算进来会凭空多出几十帧（30fps×1.3s≈40），被误判成漂移。
                 # >0 且持续变大 = 帧堆在 ffplay 里没解出来 = 延迟在漂；≈0/为负 = 安全。
                 # 注意 ffplay 的 KB 是 1024 进制，换算 ms 要 ×1024。
+                startup = ff_stats["sent0"]
+                sent = frames_total["n"] - startup
+                send_fps = sent / dur if dur > 1.0 else 0.0
                 net = sent - ff_stats["frame"]
                 run_dur = time.time() - run_t0
                 avg_kbps = bytes_total["n"] * 8 / 1000.0 / run_dur if run_dur > 0.5 else 0.0
@@ -620,9 +740,19 @@ def main():
                     f"\n[ffplay] 解码器实际输出 {dec_fps:.2f} fps，累计解码 {ff_stats['frame']} 帧"
                     f"（解码持续 {dur:.0f}s；这是 showinfo 数出来的**解码器输出**，不是我们送了多少）"
                 )
+                # 延迟拆解：App 侧 vs PC 侧。330ms 这种量级必须知道它在哪一半，
+                # 否则两边一起调纯属碰运气。
+                if app_lat["tn"]:
+                    sys.stderr.write(
+                        f"\n[延迟拆解] App 侧（采集→送出，含相机 HAL 管线 + 编码器缓冲）平均 "
+                        f"{app_lat['tsum'] / app_lat['tn'] / 10:.1f}ms / 峰值 {app_lat['max'] / 10:.1f}ms；"
+                        f"PC 侧：写队列 ≤{args.write_q} 帧（≤{args.write_q * 1000 / max(1, args.fps):.0f}ms）"
+                        f"+ ffplay 内部包队列峰值 {vq_ms:.0f}ms + 解码显示约 2 帧"
+                    )
                 sys.stderr.write(
-                    f"\n[ffplay] 同段我们送出 {sent} 帧（{send_fps:.2f} fps）→ 净积压 {net} 帧"
-                    f"；净积压 >0 且在变大 = 延迟在漂，≈0 或为负 = 安全"
+                    f"\n[ffplay] 同段（自 ffplay 解出首帧起）我们送出 {sent} 帧"
+                    f"（{send_fps:.2f} fps）→ 净积压 {net} 帧；>0 且在涨 = 延迟在漂，≈0 或为负 = 安全"
+                    + (f"（起播探测期另送入 {startup} 帧，不计入）" if startup else "")
                 )
                 sys.stderr.write(
                     f"\n[ffplay] ffplay 内部包队列 峰值 {ff_stats['vq_max']}KB"
@@ -632,7 +762,14 @@ def main():
                 sys.stderr.write(
                     f"\n[ffplay] 播放帧率设定 {args.fps + args.fps_boost}"
                     f"（--fps {args.fps} + boost {args.fps_boost}）；"
-                    + _drift_verdict(net, ff_stats["fd"], args.fps_boost)
+                    + _drift_verdict(net, dur, ff_stats["fd"], args.fps_boost)
+                )
+                # 关键帧请求统计：on_demand 越多说明链路越常出现"解码器要花屏"，
+                # 那正是用户感知的卡顿；fferr 是 ffplay 报的解码错误次数。
+                sys.stderr.write(
+                    f"\n[ctrl] 关键帧请求：周期兜底 {idr_stat['periodic']} 次 / "
+                    f"按需 {idr_stat['ondemand']} 次；ffplay 解码报错 {idr_stat['fferr']} 次。"
+                    f"按需次数高 = 常丢 IDR，考虑提 FEC 比例或降码率"
                 )
                 # 一帧都没解出来 = ffplay 根本没跑起来（或编码格式不匹配），
                 # 把它的原始报错打出来，否则只能看到 "0.00 fps" 无从下手。
