@@ -3,17 +3,75 @@
 本文档记录 RobotControl（狼牙视觉）的版本变更。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased] — 2026-10-20
+## [0.5.0] — 2026-10-22（60fps 整合 + 笔记本操控 HUD）
 
-### 新增（公开数据集驱动的检测管线改进，v0.5.0）
+> 本版汇集 10-20 ~ 10-22 三条线的全部工作：图传线（合作者延迟优化 + RTP 修复 +
+> 60fps 解锁整合）、视觉线（数据集驱动的检测改进 + 第二码流 + 开火下发 + 叠加 UI）、
+> 新增电脑端（笔记本操控 HUD + MC mod 任务书）。
+
+### 新增（60fps 实验档，整合合作者高帧率研究）
+
+合作者逆向荣耀相机 dex 解锁 1080p60/720p120 并以 Camera60Test 实测：
+**HAL 超表接受 `[60,60]`**（设备 AE 表通常只报到 [30,30]）。整合为：
+
+- `CameraStreamer.caps()`：帧率档 15/24/30 → **15/24/30/60**；60 档准入放宽为
+  「最高显式固定档 ≥30 即列出」（超表尝试）
+- **小米适配**（本机载体为小米，非荣耀）：
+  - 厂商私有 tag 分支：仅荣耀下发 `com.hihonor.capture.metadata.hw-video-fps=60`；
+    小米/HyperOS 对第三方 Camera2 的 fps 限制更宽松，超表请求通常直接被 HAL 接受，
+    其余厂商无公开记录 tag 一律跳过（反射失败无害）
+  - `onConfigureFailed` 兜底：60fps 被 HAL 拒绝时自动回退 30fps 重试
+    （重建 sender 帧率参数，编码器/surface 不动，秒级恢复；`fpsFallbackTried` 防死循环）
+  - HAL 实际 fps range 回读日志（CaptureResult.CONTROL_AE_TARGET_FPS_RANGE）：
+    请求 60 实际给多少一看便知
+- 720p120 高速会话（`createConstrainedHighSpeedCaptureSession`）**未整合**：
+  与图传三 surface（编码器+预览+视觉）架构冲突且 API 30 起 deprecated，
+  参考 Camera60Test `startHighSpeedRecording` 留待办
+
+### 改进（端到端延迟诊断与低延迟优化，合作者线）
+
+实测设备 HAL 在途 8 帧（≈264ms @30fps）是延迟大头：
+
+- App 侧（CameraStreamer）：
+  - **Stream Use Case**（API 33+）：VIDEO_CALL/PREVIEW 替代 TEMPLATE_RECORD 的
+    VIDEO_RECORD 语义（官方明示 substantial lag）
+  - 低延迟 ISP：NR/EDGE/TONEMAP=FAST + 视频防抖关（HIGH_QUALITY 多帧融合每项多背 1~2 帧）
+  - HAL 管线深度量化：REQUEST_PIPELINE_MAX_DEPTH 上限 + CaptureResult 实际值（Byte 键）
+  - 真实 applat：`nanoTime - ptsUs×1000`（旧值只测编码回调内部耗时）
+  - 编码器延迟验证：KEY_LATENCY output format 实际值
+- PC 侧（video_host.py）：
+  - SO_RCVBUF 4MB（Win 默认 64KB，一帧 ~100KB 突发装不下→gap 丢包）
+  - 写队列 `--write-q 3`（丢帧保延迟）
+  - 事件驱动关键帧（组装超时/解码错误/突发丢包 → SS_RFI_REQUEST，Moonlight 同款，
+    IDR 丢失恢复 2s → 约 1 帧）
+  - 净积压速率判据（>0.3 帧/s 才判漂移，避免起播探测期误判）+ 退出延迟拆解报告
+
+### 新增（笔记本操控 HUD，pc_hud/）
+
+PyQt5 桌面程序（用户选定方案：PyQt 桌面 + 电脑本地叠加 + 设置双向同步 + WLAN 直连 ESP32）：
+
+- `pc_hud/warhud/stream.py`：ffmpeg 子进程解码裸流（`-flags low_delay` +
+  `udp://...?fifo_size=8388608&overrun_nonfatal=1`）→ RGB 帧管道
+- `pc_hud/warhud/overlay.py`：War Thunder 风格 HUD——中央准星 + 弹道下坠刻度 +
+  提前量标记（跟随卡尔曼速度）、检测框（绿高地/红基地）、追踪框 + 速度矢量、
+  状态面板（电压/电流/温度/轮速）、弹药/计时/连接状态条
+- `pc_hud/warhud/phonesync.py`：视觉结果 UDP 接收（31001）+ 设置双向同步
+  （31002；手机 SharedPreferences 为权威源，电脑改→发手机→广播快照确认）
+- `pc_hud/warhud/esp32.py`：WLAN 直连 ESP32-S3（TCP 31010 输入帧 10Hz /
+  31011 遥测帧；fire 边沿触发，仅状态变化发包）
+- `pc_hud/warhud/main_window.py`：鼠标捕获 FPS 云台控制（0.12°/px）+ Tab 设置面板
+- 自测：`protocol.py` 13/13 + `smoke_test.py`（offscreen）13/13
+- 帧格式见 `PROTOCOL.md`「电脑 HUD 协议」节；电控待办：ESP32 WLAN TCP server
+
+### 改进（公开数据集驱动的检测管线）
 
 基于 rmcv/armor 公开数据集（9123 张真实赛场图 / 15751 装甲板，CC-BY-4.0）
-的评测结论（详见资产 `EVAL_REPORT.md`）：真实暗光下红/蓝目标 V 掉到 0.1-0.3、
-色相偏橙，原 HSV 阈值在真实图上覆盖率仅 2.4%。
+的评测结论：真实暗光下红/蓝目标 V 掉到 0.1-0.3、色相偏橙，原 HSV 阈值在
+真实图上覆盖率仅 2.4%。
 
 - **`vision/preprocess/VNormalize.kt`（新）**：V 通道 CLAHE 归一化
   （8×8 分块、clip=2.0×均值、CDF 映射表、块间双线性插值、RGB 按 V 等比例缩放）。
-  单一object 无 native 依赖，实测 V 提升 17.2%、H 漂移 0.4°。设置项
+  单一 object 无 native 依赖，实测 V 提升 17.2%、H 漂移 0.4°。设置项
   `v_normalize`（默认开）经 `VisionPipeline` 传入两个检测器
 - **`vision/detect/Hsv.kt`**：红色掩码 345-15/S≥0.40/V≥0.30 →
   **345-40 回绕/S≥0.45/V≥0.12**（与公开数据基准配置逐项一致）；
