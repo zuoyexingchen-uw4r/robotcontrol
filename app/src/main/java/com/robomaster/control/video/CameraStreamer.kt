@@ -107,6 +107,9 @@ class CameraStreamer(
     private var pendingCsd: ByteArray? = null
     private var controlChannel: TcpChannel? = null
     private var thread: HandlerThread? = null
+
+    /** 60fps 超表实验档是否已回退过一次（防止回退后再次失败形成死循环） */
+    private var fpsFallbackTried = false
     private var handler: Handler? = null
 
     private var frameCount = 0
@@ -150,7 +153,7 @@ class CameraStreamer(
             .distinct()
             .sortedWith(compareByDescending<Size> { it.height }.thenByDescending { it.width })
 
-        // 帧率：只提供 15/24/30 三档固定帧率，其余一律不列。
+        // 帧率：默认 15/24/30 三档固定帧率 + 60 实验档，其余一律不列。
         //
         // 为什么钉死档位（而不是罗列设备支持的所有范围）：
         // 接收端 ffplay 对无 PTS 的裸流只能**猜**播放帧率。实测 30fps 档它按 29.8 播，
@@ -159,12 +162,25 @@ class CameraStreamer(
         // ffplay 猜测值的**安全侧**，且帧率本身必须稳定。
         // 固定档位 + Camera2 设 Range(n,n)（见 buildSession）保证 PTS 间隔均匀，
         // 猜测偏差再多也只是一个固定偏移，不会随时间为积压。
-        // 档位选取规则：设备显式暴露 Range(n,n) 就用；否则只要某范围覆盖 n，
-        // 也按 Range(n,n) 请求（Camera2 通常接受范围内的固定值）——即"往上匹配"。
+        //
+        // 60 档的准入（合作者 camera2 实测结论，骁龙 HAL 通用）：
+        // 设备的 AE 表通常只报到 [30,30]，但 HAL **超表接受** [60,60]
+        // （合作者在荣耀 SM6450 实测 1080p60 成功：预览 53.5fps 实拍、录像正常）。
+        // 所以 60 档准入条件放宽为：显式含 60 直接用；否则只要最高显式固定档
+        // ≥ 30 也列出，标记为「实验档」——请求后由 onConfigureFailed 回退逻辑
+        // 兜底（见 buildSession），并在日志回读 HAL 实际接受的 range。
+        // 小米/HyperOS 对第三方 Camera2 的 fps 限制比荣耀宽松，60 档成功率更高；
+        // 荣耀额外需要私有 vendor tag 下发（见 buildSession 的 buildVendorFpsKey）。
         val allRanges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
         val explicitFixed = allRanges.filter { it.lower == it.upper }.map { it.upper }.toSet()
-        val fps = listOf(30, 24, 15)
-            .filter { n -> explicitFixed.contains(n) || allRanges.any { it.lower <= n && n <= it.upper } }
+        val maxFixed = explicitFixed.maxOrNull() ?: 0
+        val fps = listOf(60, 30, 24, 15)
+            .filter { n ->
+                when (n) {
+                    60 -> explicitFixed.contains(60) || maxFixed >= 30  // 实验档：超表尝试
+                    else -> explicitFixed.contains(n) || allRanges.any { it.lower <= n && n <= it.upper }
+                }
+            }
             .distinct()
             .map { android.util.Range(it, it) }
 
@@ -221,6 +237,7 @@ class CameraStreamer(
 
     private suspend fun openAndStream(cfg: Config) = withContext(Dispatchers.IO) {
         currentCfg = cfg
+        fpsFallbackTried = false
         repeatCsdPerIdr = when (cfg.repeatCsd) {
             1 -> true                       // 始终重复（修复的 264 / 265）
             2 -> false                      // 从不重复（未修复）
@@ -298,6 +315,36 @@ class CameraStreamer(
         }
     }
 
+    /**
+     * 构造厂商私有 fps vendor tag 的 CaptureRequest.Key（尽力而为，失败/无记录返回 null）。
+     *
+     * 目前只有荣耀有公开记录的 fps 私有 tag：
+     *   com.hihonor.capture.metadata.hw-video-fps（int）
+     * 由合作者逆向荣耀相机 dex 得出，是荣耀相机 app 自己的 60fps 解锁开关。
+     *
+     * **小米/HyperOS 不需要**：小米对第三方 Camera2 的 fps 限制比荣耀宽松，
+     * 超表请求 CONTROL_AE_TARGET_FPS_RANGE=[60,60] 通常直接被 HAL 接受，
+     * 是否接受由 depthCb 回读 HAL 实际 range 确认。其他厂商（OPPO/vivo/三星）
+     * 没有公开记录的等价 tag，一律返回 null。
+     */
+    private fun buildVendorFpsKey(): CaptureRequest.Key<Int>? {
+        val brand = (Build.BRAND + " " + Build.MANUFACTURER).uppercase()
+        val tag = when {
+            brand.contains("HONOR") || brand.contains("HIHONOR") ->
+                "com.hihonor.capture.metadata.hw-video-fps"
+            else -> return null
+        }
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val keyCls = Class.forName("android.hardware.camera2.CaptureRequest\$Key")
+            val c = keyCls.getDeclaredConstructor(String::class.java, Class::class.java)
+            c.isAccessible = true
+            c.newInstance(tag, Int::class.javaPrimitiveType) as CaptureRequest.Key<Int>
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     private fun buildSession(cd: CameraDevice, cfg: Config) {
         val targets = mutableListOf<Surface>()
         cfg.previewSurface?.let { targets += it }
@@ -312,12 +359,26 @@ class CameraStreamer(
         // 实测这台设备上限 8 帧，但实际用几帧必须读出来才知道——这是相机侧延迟的
         // 唯一真实读数，之前完全没取。
         var loggedDepth = -1
+        var loggedFps = false
         val depthCb = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(
                 session: CameraCaptureSession,
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
+                // HAL 实际接受的 fps range 回读：60 档是超表实验档，接不接受必须
+                // 看 HAL 的真实回执而不是请求值（小米/HyperOS 通常直接接受，
+                // 少数机型/驱动会静默压回 30）
+                val r = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)
+                if (!loggedFps && r != null) {
+                    loggedFps = true
+                    if (r.upper < cfg.fps) {
+                        onLog("[图传] ⚠️ 请求 ${cfg.fps}fps，HAL 实际只接受 ${r.lower}-${r.upper}")
+                    } else {
+                        onLog("[图传] HAL 接受 fps range = ${r.lower}-${r.upper}"
+                            + if (cfg.fps > 30) "（${cfg.fps}fps 超表请求成功）" else "")
+                    }
+                }
                 // ⚠️ 这个键是 **Byte** 类型（AOSP: new Key("android.request.pipelineDepth", Byte.class)），
                 // 不是 Int——直接和 Int 比较编译不过。
                 val d = result.get(CaptureResult.REQUEST_PIPELINE_DEPTH)?.toInt() ?: return
@@ -336,6 +397,21 @@ class CameraStreamer(
                     targets.forEach { addTarget(it) }
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(cfg.fps, cfg.fps))
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                }
+                // 厂商私有 fps tag（仅 >30fps 请求时尝试，尽力而为）：
+                // 合作者在荣耀 SM6450 上逆向出 com.hihonor.capture.metadata.hw-video-fps=60，
+                // 是荣耀相机 app 自己用的解锁开关。**小米/HyperOS 不需要**——小米对第三方
+                // Camera2 的 fps 限制比荣耀宽松，超表请求 [60,60] 通常直接被 HAL 接受。
+                // 其余厂商没有公开记录的等价 tag，一律跳过（反射失败也无害）。
+                if (cfg.fps > 30) {
+                    buildVendorFpsKey()?.let { key ->
+                        try {
+                            base.set(key, cfg.fps)
+                            onLog("[图传] 已附加私有 vendor tag ${key.name} = ${cfg.fps}")
+                        } catch (t: Throwable) {
+                            onLog("[图传] vendor tag 下发失败（忽略）: ${t.message}")
+                        }
+                    }
                 }
                 // 低延迟 ISP 设置：NOISE_REDUCTION / EDGE / TONEMAP 的 HIGH_QUALITY
                 // 档会做**多帧融合**，每项都可能多背 1~2 帧；FAST 是逐帧处理。
@@ -371,6 +447,24 @@ class CameraStreamer(
                 onLog("[图传] 推流中 → ${cfg.hostIp}:${cfg.videoPort}")
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
+                // 60fps 实验档兜底：HAL 直接拒绝超表请求时，自动回退 30fps 重试一次
+                // （骁龙 HAL 通常超表接受，但少数机型/驱动版本会拒；回退只重建
+                // sender 的帧率参数，编码器/surface 不动，秒级恢复）
+                if (cfg.fps > 30 && !fpsFallbackTried) {
+                    fpsFallbackTried = true
+                    val fb = cfg.copy(fps = 30)
+                    currentCfg = fb
+                    runCatching { sender?.close() }
+                    sender = GameStreamSender(fb.hostIp, fb.videoPort, fb.bitrate, fb.fps, fb.fecPercentage)
+                        .apply {
+                            onLog = this@CameraStreamer.onLog
+                            onIdle = { idleMs -> maybeBoostKeyframe(fb, idleMs) }
+                            onDrop = { maybeKeyframeAfterDrop() }
+                        }
+                    onLog("[图传] ${cfg.fps}fps 会话被 HAL 拒绝，已自动回退 30fps（编码器不变）")
+                    buildSession(cd, fb)
+                    return
+                }
                 onLog("[图传] 会话配置失败")
             }
         }
