@@ -147,3 +147,52 @@ python host/rs_selftest.py
 
 > 发送条件：USB 通道 Connected 才发（WLAN 降级不发，开火延迟敏感）。
 > 序列化实现：`FireController.serialize()` / `Navigation.serialize()`。
+
+## 电脑 HUD 协议（笔记本操控主控）
+
+电脑端 PyQt HUD（pc_hud/）与手机、ESP32-S3 的三条链路。端口约定如下，
+帧格式实现见 `pc_hud/warhud/protocol.py`（自测 13/13）。
+
+### 1. 图传（既有链路，不变）
+
+手机 CameraStreamer → UDP `video_port`（默认 31000）裸 H.264/HEVC + RS-FEC。
+HUD 用 ffmpeg 子进程解码：`-flags low_delay` + `udp://...?fifo_size=8388608&overrun_nonfatal=1`。
+
+### 2. 视觉结果 + 设置同步（UDP）
+
+| 方向 | 端口 | 消息 | 频率 |
+|---|---|---|---|
+| 手机 → 电脑 | UDP 31001（广播） | `vision` 视觉结果帧 | 视觉帧率（~15Hz） |
+| 手机 → 电脑 | UDP 31001（广播） | `settings` 设置快照 | 500ms 心跳 |
+| 电脑 → 手机 | UDP 31002（单播） | `hello` 上线宣告 | 连接时一次 |
+| 电脑 → 手机 | UDP 31002（单播） | `set_req` 设置变更 | 用户操作时 |
+
+- **权威源是手机 SharedPreferences**：电脑改 → `set_req` 发手机 → 手机写入 →
+  下一次 `settings` 广播全量确认 → 电脑刷新 UI。电脑乐观更新 + 快照校验。
+- `vision` 帧 JSON：`{t, ts, fps, lat_ms, targets[], track{}, fire{}, proc_ms{}}`。
+  targets 元素 `{type: highland|base, cx, cy, w, h, conf}`，坐标为手机视觉
+  基准分辨率（640×480）像素；track 含 `vx/vy/dist_mm/yaw_deg/pitch_deg`。
+
+### 3. 操作输入 + 遥测（WLAN TCP，电脑直连 ESP32-S3）
+
+| 方向 | 端口 | 帧 |
+|---|---|---|
+| 电脑 → ESP32 | TCP 31010 | 输入帧 `0xFA 0xAE` |
+| ESP32 → 电脑 | TCP 31011 | 遥测帧 `0xFA 0xEA` |
+
+**输入帧**（13 字节）：`0xFA 0xAE | yaw i16(0.01°) | pitch i16(0.01°) | fire u8 | mx i16(mm/s) | my i16(mm/s) | btn u8 | XOR`
+
+- 10Hz 定步长，**仅状态变化或 fire 边沿时发包**（ESP32 保持最后状态）
+- fire 边沿触发：电脑长按也只发一帧 True，击发逻辑在下位机
+
+**遥测帧**（14 字节）：`0xFA 0xEA | voltage u16(mV) | current u16(mA) | temp i16(0.1°C) | rpm_l u16 | rpm_r u16 | status u8 | XOR`
+
+### 操作权仲裁
+
+电脑接入即接管：手机 APP 检测到电脑输入帧在线时禁用本机操作输入，
+退化为纯视觉+图传节点。ESP32 只透传不仲裁。
+
+### 电控侧待办
+
+- ESP32-S3 写 WLAN TCP server：31010 收输入帧 → 解析后经光电隔离 UART
+  转 CH32X03S；31011 推遥测帧（CH32X03S 数据 10Hz 汇总）
