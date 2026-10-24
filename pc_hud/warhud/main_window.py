@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
 from . import config as cfgmod
 from . import protocol
 from .esp32 import Esp32Link
+from .gamepad import Gamepad
 from .overlay import HudOverlay
 from .phonesync import PhoneSync
 from .stream import StreamDecoder
@@ -39,10 +40,10 @@ class _Signals(QObject):
 
 class MainWindow(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, gamepad: Gamepad | None = None):
         super().__init__()
         self.cfg = cfgmod.load()
-        self.setWindowTitle("狼牙视觉 · 操控 HUD v0.1")
+        self.setWindowTitle("狼牙视觉 · 操控 HUD v0.2")
         self.resize(1360, 800)
         self.setMinimumSize(960, 600)
 
@@ -62,13 +63,17 @@ class MainWindow(QMainWindow):
         self._last_frame_seq = -1
         self._fps_window = []          # (t, seq) 估视频解码帧率
 
-        # 输入状态（鼠标捕获时持续更新）
+        # 输入状态（手柄连续量积分 + 键鼠后备）
         self._input_yaw = 0.0
         self._input_pitch = 0.0
         self._mouse_captured = False
         self._last_mouse_x = 0
         self._last_mouse_y = 0
-        self._match_start = time.monotonic()
+        self._elapsed_s = 0.0           # 比赛已进行秒数（START 可暂停）
+        self._paused = False
+        self._last_tick = time.monotonic()
+        # 手柄（USB，pygame/SDL；未插自动降级键鼠）。测试可注入 MockSource。
+        self.pad = gamepad if gamepad is not None else Gamepad(cfg=self.cfg)
 
         self._build_ui()
         self._build_settings_panel()
@@ -99,6 +104,9 @@ class MainWindow(QMainWindow):
         self.lbl_phone_ip = QLabel("手机：--")
         self.lbl_phone_ip.setStyleSheet("color:#9E9E9E;")
         bl.addWidget(self.lbl_phone_ip)
+        self.lbl_pad = QLabel("手柄：检测中…")
+        self.lbl_pad.setStyleSheet("color:#9E9E9E;")
+        bl.addWidget(self.lbl_pad)
         bl.addStretch(1)
         btn_settings = QPushButton("视觉设置 (Tab)")
         btn_settings.clicked.connect(self._toggle_settings)
@@ -178,6 +186,7 @@ class MainWindow(QMainWindow):
             self.btn_link.setText("ESP32：已连接")
         else:
             self.btn_link.setText(f"ESP32：重试（{self.esp32.last_error[:24]}…）")
+        self.pad.start()
 
     def _toggle_esp32(self) -> None:
         if self.esp32.connected:
@@ -192,6 +201,9 @@ class MainWindow(QMainWindow):
     # ─────────── 主循环 ───────────
 
     def _tick(self) -> None:
+        now = time.monotonic()
+        dt = min(0.1, max(0.0, now - self._last_tick))
+        self._last_tick = now
         frame, seq = self.decoder.latest_frame()
         if seq != self._last_frame_seq and frame:
             self._last_frame_seq = seq
@@ -222,10 +234,70 @@ class MainWindow(QMainWindow):
             "color:#32D74B;font-size:11px;" if self.phone.settings_alive
             else "color:#9E9E9E;font-size:11px;")
 
-        # 比赛计时
-        self.hud.time_left_s = self.cfg["match_minutes"] * 60 - int(
-            time.monotonic() - self._match_start)
+        # 手柄输入（连续量积分 + 边沿动作）
+        self._poll_gamepad(dt)
+
+        # 比赛计时（START 可暂停）
+        if not self._paused:
+            self._elapsed_s += dt
+        self.hud.paused = self._paused
+        self.hud.time_left_s = max(0, self.cfg["match_minutes"] * 60
+                                   - int(self._elapsed_s))
         self.canvas.update()
+
+    # ─────────── 手柄输入（主操控；键鼠降级后备） ───────────
+
+    def _poll_gamepad(self, dt: float) -> None:
+        st = self.pad.state()
+        self.hud.pad_connected = st.connected
+        if st.connected:
+            self.lbl_pad.setText(f"手柄：{self.pad.name}")
+            self.lbl_pad.setStyleSheet("color:#32D74B;")
+            # 右摇杆角速度积分 → 云台目标角（LT 精确瞄准减速）
+            scale = self.cfg.get("gamepad_aim_slow_scale", 0.35) if st.aim_slow else 1.0
+            self._input_yaw += st.yaw_rate * scale * dt
+            self._input_pitch = max(-45.0, min(45.0,
+                                               self._input_pitch + st.pitch_rate * scale * dt))
+            self.esp32.current_input["yaw"] = self._input_yaw
+            self.esp32.current_input["pitch"] = self._input_pitch
+            self.esp32.current_input["mx"] = st.mx
+            self.esp32.current_input["my"] = st.my
+        else:
+            self.lbl_pad.setText("手柄：未检测到（键鼠后备）")
+            self.lbl_pad.setStyleSheet("color:#9E9E9E;")
+            # 无手柄时清底盘指令，避免摇杆回中前的残值
+            self.esp32.current_input["mx"] = 0
+            self.esp32.current_input["my"] = 0
+
+        for kind in self.pad.drain_actions():
+            self._on_pad_action(kind)
+
+    def _on_pad_action(self, kind: str) -> None:
+        if kind == "fire":
+            self.esp32.queue_fire()
+            self.hud.flash_fire()
+        elif kind == "toggle_settings":
+            self._toggle_settings()
+        elif kind == "toggle_pause":
+            self._paused = not self._paused
+        elif kind == "toggle_autofire":
+            self._set_switch("autofire", not self._switches["autofire"].isChecked())
+        elif kind == "cycle_target":
+            if self._switches["highland"].isChecked():
+                self._set_switch("highland", False)
+                self._set_switch("base", True)
+            else:
+                self._set_switch("highland", True)
+                self._set_switch("base", False)
+        elif kind == "toggle_overlay":
+            self.hud.show_detect = not self.hud.show_detect
+        elif kind == "cycle_panel":
+            self.hud.show_panel = not self.hud.show_panel
+
+    def _set_switch(self, key: str, value: bool) -> None:
+        cb = self._switches[key]
+        if cb.isChecked() != value:
+            cb.setChecked(value)   # stateChanged → _on_switch → 下发手机
 
     # ─────────── 信号回调（UI 线程） ───────────
 
@@ -265,6 +337,7 @@ class MainWindow(QMainWindow):
             self._release_mouse()
         elif e.key() == Qt.Key_F and self._mouse_captured:
             self.esp32.queue_fire()
+            self.hud.flash_fire()
         else:
             super().keyPressEvent(e)
 
@@ -302,6 +375,7 @@ class MainWindow(QMainWindow):
         pass
 
     def closeEvent(self, e) -> None:
+        self.pad.stop()
         self.esp32.stop()
         self.phone.stop()
         self.decoder.stop()
@@ -339,5 +413,5 @@ class _Canvas(QWidget):
             p.setPen(Qt.white)
             p.setFont(self.win.hud._font)
             p.drawText(self.rect(), Qt.AlignCenter,
-                       "鼠标已捕获（云台控制）· 左键/F 开火 · Esc 释放")
+                       "鼠标已捕获（云台控制·键鼠后备）· 左键/F 开火 · Esc 释放")
         p.end()

@@ -21,6 +21,11 @@ def check_deps() -> bool:
     except ImportError:
         print("✗ PyQt5 未安装：pip install PyQt5")
         ok = False
+    try:
+        import pygame  # noqa: F401
+        print("✓ pygame（USB 手柄支持）")
+    except ImportError:
+        print("! pygame 未安装：手柄不可用（键鼠仍可后备）→ pip install pygame")
     import shutil
     from warhud import config as cfgmod
     cfg = cfgmod.load()

@@ -185,6 +185,19 @@ HUD 用 ffmpeg 子进程解码：`-flags low_delay` + `udp://...?fifo_size=83886
 - 10Hz 定步长，**仅状态变化或 fire 边沿时发包**（ESP32 保持最后状态）
 - fire 边沿触发：电脑长按也只发一帧 True，击发逻辑在下位机
 
+**输入源（v0.5.1 起主操控为 USB 手柄）**：HUD 通过 pygame/SDL 轮询手柄
+（`warhud/gamepad.py`），映射如下；未插手柄自动降级键鼠（鼠标捕获 FPS 云台）。
+
+| 手柄输入 | 帧字段 | 说明 |
+|---|---|---|
+| 左摇杆 / 十字键 | mx / my | 底盘平移（mm/s，满格 800，死区 0.12 + 指数曲线） |
+| 右摇杆 | yaw / pitch | 云台角速度积分（满格 90°/s，LT 扳机 ×0.35 微瞄） |
+| RT 扳机 | fire | 边沿触发一帧 |
+| A / B / X / Y / START / SELECT | （本地动作） | 自动开火开关 / 切换追踪目标 / 叠加显隐 / 设置面板 / 计时暂停 / 面板显隐 |
+
+序号差异在 `~/.warhud/config.json` 用 `gamepad_map` 覆盖（成对覆盖，
+避免 aim_x 与 aim_axis 撞号）。
+
 **遥测帧**（14 字节）：`0xFA 0xEA | voltage u16(mV) | current u16(mA) | temp i16(0.1°C) | rpm_l u16 | rpm_r u16 | status u8 | XOR`
 
 ### 操作权仲裁

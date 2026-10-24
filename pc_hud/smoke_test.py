@@ -1,11 +1,13 @@
 """smoke_test — 无显示器环境（QT_QPA_PLATFORM=offscreen）的 UI 冒烟测试。
 
 验证：窗口组装、信号桥、HUD 离屏绘制、vision 消息处理、
-设置开关下发逻辑（phone 未启动不崩）、ESP32 未连接不崩。
+设置开关下发逻辑（phone 未启动不崩）、ESP32 未连接不崩、
+手柄输入（MockSource，无需真实硬件）。
 """
 
 import os
 import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -113,6 +115,53 @@ def main() -> int:
     # 9) 输入状态写入
     win.esp32.current_input["yaw"] = 5.0
     check("输入状态写入", win.esp32.current_input["yaw"] == 5.0)
+
+    # 10) 手柄输入（MockSource 注入，无需真实硬件）
+    from warhud.gamepad import Gamepad, MockSource, RawPad
+    src = MockSource(RawPad((0, 0, 1, -1), (False,) * 7 + (True,) + (False,) * 2, (0, 0)))
+    win.pad.stop()
+    win.pad.source = src
+    win.pad.start()
+    win.esp32._pending_fire = False   # 清掉第 7 项遗留，避免假阳性
+    time.sleep(0.15)
+    win._tick()
+    check("手柄连接状态", win.pad.state().connected)
+    check("右摇杆→云台积分",
+          win.esp32.current_input["yaw"] > 0
+          and win.esp32.current_input["pitch"] > 0,
+          f"yaw={win.esp32.current_input['yaw']:.2f} "
+          f"pitch={win.esp32.current_input['pitch']:.2f}")
+    check("RT 开火边沿触发", win.esp32._pending_fire)
+
+    # 左摇杆 → 底盘平移
+    src.raw = RawPad((0, -1, 0, 0), (False,) * 10, (0, 0))
+    time.sleep(0.15)
+    win._tick()
+    check("左摇杆→底盘平移", win.esp32.current_input["my"] == 800,
+          f"my={win.esp32.current_input['my']}")
+
+    # Y 键 → 设置面板
+    src.raw = RawPad((0, 0, 0, 0), (False, False, False, True) + (False,) * 6, (0, 0))
+    time.sleep(0.15)
+    win._tick()
+    check("Y 键切换设置面板", win.settings_panel.isVisible())
+    win._toggle_settings()
+
+    # A 键 → 自动开火开关
+    src.raw = RawPad((0, 0, 0, 0), (True,) + (False,) * 9, (0, 0))
+    time.sleep(0.15)
+    win._tick()
+    check("A 键切换自动开火", win._switches["autofire"].isChecked())
+    win._switches["autofire"].setChecked(False)
+
+    # 掉线 → 降级键鼠后备（底盘指令清零）
+    src.raw = None
+    time.sleep(0.15)
+    win._tick()
+    check("掉线降级键鼠后备",
+          not win.pad.state().connected
+          and win.esp32.current_input["mx"] == 0
+          and win.esp32.current_input["my"] == 0)
 
     win.close()
     print(f"\n{ok}/{total} 通过" + (" ✅" if ok == total else " ❌"))

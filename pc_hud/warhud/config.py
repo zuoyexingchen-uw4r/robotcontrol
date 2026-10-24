@@ -31,6 +31,17 @@ DEFAULTS = {
     "esp32_telem_port": 31011,
     "input_hz": 10,               # 输入帧发送频率
 
+    # USB 手柄操控（pygame/SDL；未插手柄自动降级键鼠）
+    # 不同手柄 axis/button 序号有差异时，用 gamepad_map 覆盖（见 warhud/gamepad.py）
+    "gamepad_deadzone": 0.12,
+    "gamepad_aim_exponent": 2.0,
+    "gamepad_move_exponent": 1.6,
+    "gamepad_move_max_mmps": 800,     # 摇杆满格底盘速度
+    "gamepad_aim_max_dps": 90.0,      # 摇杆满格云台角速度
+    "gamepad_aim_slow_scale": 0.35,   # LT 精确瞄准倍率
+    "gamepad_poll_hz": 100,
+    "gamepad_map": {},
+
     # HUD 行为
     "crosshair_color": "#7CFC00",
     "detect_color": "#FF3B30",

@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import time
+
 from PyQt5.QtCore import QPointF, QRectF, Qt
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
 
@@ -43,10 +45,19 @@ class HudOverlay:
         self.time_left_s = 300
         self.mouse_pos: QPointF | None = None      # 操作手鼠标位置（瞄准）
         self.settings_open = False
+        self.pad_connected = False                 # 手柄在线（HUD 状态）
+        self.show_detect = True                    # X 键：检测框叠加显隐
+        self.show_panel = True                     # SELECT 键：状态面板显隐
+        self.paused = False                        # START 键：计时暂停
+        self._fire_flash_until = 0.0               # 开火闪光（monotonic）
 
         self._font = QFont("Consolas", 10)
         self._font_b = QFont("Consolas", 10, QFont.Bold)
         self._font_big = QFont("Consolas", 14, QFont.Bold)
+
+    def flash_fire(self) -> None:
+        """开火闪光（主窗口收到 fire 动作时调用）。"""
+        self._fire_flash_until = time.monotonic() + 0.12
 
     # ─────────── 主绘制 ───────────
 
@@ -57,10 +68,12 @@ class HudOverlay:
         base_w, base_h = 640.0, 480.0
         sx, sy = w / base_w, h / base_h
 
-        self._draw_detections(p, sx, sy)
+        if self.show_detect:
+            self._draw_detections(p, sx, sy)
         self._draw_crosshair(p, w, h)
-        self._draw_status_panel(p, w, h)
-        self._draw_ammo_panel(p, w, h)
+        if self.show_panel:
+            self._draw_status_panel(p, w, h)
+            self._draw_ammo_panel(p, w, h)
         self._draw_conn_strip(p, w, h)
         if not self.video_alive:
             self._draw_no_video(p, w, h)
@@ -103,13 +116,17 @@ class HudOverlay:
     def _draw_crosshair(self, p: QPainter, w: int, h: int) -> None:
         cx, cy = w / 2, h / 2
         col = QColor(self.cfg["crosshair_color"])
-        p.setPen(QPen(col, 1.5))
+        flash = time.monotonic() < self._fire_flash_until
+        p.setPen(QPen(col, 2.5 if flash else 1.5))
         L, gap = 14, 5
         p.drawLine(QPointF(cx - L, cy), QPointF(cx - gap, cy))
         p.drawLine(QPointF(cx + gap, cy), QPointF(cx + L, cy))
         p.drawLine(QPointF(cx, cy - L), QPointF(cx, cy - gap))
         p.drawLine(QPointF(cx, cy + gap), QPointF(cx, cy + L))
         p.drawEllipse(QPointF(cx, cy), gap, gap)
+        if flash:
+            p.setPen(QPen(QColor("#FFFFFF"), 1))
+            p.drawEllipse(QPointF(cx, cy), gap + 5, gap + 5)
 
         # 弹道下坠刻度（每格 1.8mrad ≈ 0.1°@50m，示意）
         p.setFont(QFont("Consolas", 8))
@@ -168,10 +185,13 @@ class HudOverlay:
         p.drawText(QPointF(x + 8, y + 32), f"弹药  {self.ammo}")
         m, s = divmod(max(0, self.time_left_s), 60)
         p.drawText(QPointF(x + 8, y + 46), f"时间  {m:02d}:{s:02d}   第 {self.round_no} 局")
+        if self.paused:
+            p.setPen(QPen(QColor("#FFD60A")))
+            p.drawText(QPointF(x + 8, y + 46), "        已暂停（START 继续）")
         p.drawText(QPointF(x + 8, y + 60), f"比分  己 {self.score_self} : {self.score_foe} 敌")
         p.setFont(QFont("Consolas", 8))
         p.setPen(QPen(QColor("#9E9E9E")))
-        p.drawText(QPointF(x + 8, y + 76), "F 开火 · Tab 设置 · Esc 释放鼠标")
+        p.drawText(QPointF(x + 8, y + 76), "RT 开火 · LT 微瞄 · Y 设置 · START 暂停 · Esc 鼠标后备")
 
     # ─────────── 底部：连接状态条 ───────────
 
@@ -181,7 +201,8 @@ class HudOverlay:
         x = 12
         for name, alive in (("视频", self.video_alive),
                             ("视觉", self.vision_alive),
-                            ("ESP32", self.esp32_alive)):
+                            ("ESP32", self.esp32_alive),
+                            ("手柄", self.pad_connected)):
             p.setPen(QPen(QColor("#32D74B" if alive else "#FF3B30"), 2))
             p.drawEllipse(QPointF(x + 4, y + 15), 4, 4)
             p.setFont(self._font)
