@@ -9,12 +9,20 @@
 - Python 3.10+
 - PyQt5：`pip install PyQt5`
 - pygame（USB 手柄，SDL 即插即用）：`pip install pygame`
-- ffmpeg（系统 PATH，或改 `~/.warhud/config.json` 的 `ffmpeg_path`）
+- ffmpeg（系统 PATH，或改 `~/.warhud/config.json` 的 `ffmpeg_path`；
+  **也可把静态构建的 `ffmpeg.exe` 放到 `pc_hud/bin/`，启动时自动优先使用**。
+  没有现成二进制时一条命令获取：`pip install imageio-ffmpeg`，再把
+  `imageio_ffmpeg.get_ffmpeg_exe()` 指向的 exe 复制到 `pc_hud/bin/` 即可）
 
 ```bash
 python hud.py --check     # 检查依赖（pygame 缺失只警告，不阻塞启动）
 python hud.py             # 启动
 ```
+
+桌面快捷方式（已创建）：双击「狼牙视觉 HUD」= 用项目 venv 的
+python 以 `pc_hud/` 为工作目录执行 `hud.py`。重建方法：
+`powershell -ExecutionPolicy Bypass -File create_hud_shortcut.ps1`
+（换机器/换 python 环境时重跑即可；脚本在仓库里）。
 
 ## 架构
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field, asdict
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".warhud")
@@ -17,7 +18,8 @@ DEFAULTS = {
     "decode_w": 1280,
     "decode_h": 720,
 
-    # ffmpeg 可执行文件（PATH 找不到时在此填绝对路径）
+    # ffmpeg 可执行文件（PATH 找不到时在此填绝对路径；
+    # 也可放到 pc_hud/bin/ffmpeg.exe，load() 会自动优先使用）
     "ffmpeg_path": "ffmpeg",
 
     # 视觉结果 / 设置同步（手机广播源）
@@ -52,6 +54,14 @@ DEFAULTS = {
 }
 
 
+def _local_ffmpeg() -> str:
+    """项目自带 ffmpeg（pc_hud/bin/ffmpeg.exe）：PATH 里没有时用它。
+    静态构建放进去即可，换机器不用改配置。"""
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "bin", "ffmpeg.exe")
+    return p if os.path.exists(p) else ""
+
+
 def load() -> dict:
     cfg = dict(DEFAULTS)
     try:
@@ -59,6 +69,12 @@ def load() -> dict:
             cfg.update(json.load(f))
     except (OSError, json.JSONDecodeError):
         pass
+    # ffmpeg 解析顺序：config 绝对路径 → PATH → 项目本地 bin/
+    ff = cfg["ffmpeg_path"]
+    if not (os.path.isabs(ff) and os.path.exists(ff)) and shutil.which(ff) is None:
+        local = _local_ffmpeg()
+        if local:
+            cfg["ffmpeg_path"] = local
     return cfg
 
 
@@ -79,4 +95,9 @@ if __name__ == "__main__":
     assert c2["video_port"] == 31999
     c2["video_port"] = DEFAULTS["video_port"]
     save(c2)
+    # 本地 bin/ffmpeg.exe 解析（有则解析为绝对路径）
+    local = _local_ffmpeg()
+    if local:
+        assert os.path.isabs(c2["ffmpeg_path"]) and os.path.exists(c2["ffmpeg_path"])
+        print(f"本地 ffmpeg 解析：{c2['ffmpeg_path']}")
     print("warhud.config 自测通过（往返保存/加载）")

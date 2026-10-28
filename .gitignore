@@ -12,3 +12,6 @@ local.properties
 
 # 临时
 *.log
+
+# HUD 本地 ffmpeg（大二进制，不入库；见 pc_hud/README.md）
+pc_hud/bin/
