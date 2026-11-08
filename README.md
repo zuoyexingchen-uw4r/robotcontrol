@@ -74,11 +74,14 @@ app/src/main/java/com/robomaster/control/
 │   ├── VisionPipeline.kt      # 主管线
 │   ├── VisionCamera.kt        # 独立第二会话（ImageReader + 帧回调 + YUV→RGB）
 │   ├── VisionOverlayView.kt   # 检测结果叠加视图
-│   ├── preprocess/           # Deblur / Smoothing / Deglare
+│   ├── preprocess/           # Deblur / Smoothing / Deglare / VNormalize
+│   │                         # Gaussian（可分离高斯）/ GuidedFilter（O(1) 导向滤波）
 │   ├── detect/               # Hsv / Morphology / Components / MinAreaRect / TargetDetector
-│   ├── track/                # KalmanFilterCV
-│   ├── solve/                # Pinhole（测距测角弹道）
-│   ├── decide/               # FireController
+│   │                         # SubpixelRect（亚像素尺寸）/ Nms（IoU 抑制）
+│   │                         # StructureTensor（λ1/λ2 + 双角平均）
+│   ├── track/                # KalmanFilterCV（NIS 软门控）
+│   ├── solve/                # Pinhole（测距测角 + 不确定度传播 + 逆方差融合）
+│   ├── decide/               # FireController（弹道 + 置信度门限）
 │   └── nav/                  # Navigation（占位）
 └── ...
 ```
@@ -91,12 +94,29 @@ gradle assembleDebug
 # APK: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-自测（预处理算法，纯 Kotlin 无 Android 依赖）：
+自测（纯 Kotlin，无 Android 依赖；用 Android Studio 自带 kotlinc 即可）：
 
 ```bash
-kotlinc vision/preprocess/*.kt vision/preprocess/Selftest.kt -include-runtime -d selftest.jar
-java -jar selftest.jar   # 期望 7/7 通过
+APP=app/src/main/java/com/robomaster/control/vision
+T=app/src/test/java/com/robomaster/control/vision
+
+# 1) 预处理 7 项
+kotlinc $APP/preprocess/*.kt $T/preprocess/Selftest.kt -include-runtime -d st_pre.jar
+java -jar st_pre.jar                       # 期望 7/7
+
+# 2) 检测 36 项
+kotlinc $APP/detect/*.kt $APP/preprocess/*.kt $APP/solve/Pinhole.kt \
+        $T/detect/SelftestDetect.kt -include-runtime -d st_det.jar
+java -jar st_det.jar                       # 期望 36/36
+
+# 3) 数学增强 49 项（高斯/导向滤波/色相环形/亚像素/NMS/结构张量/NIS/不确定度）
+kotlinc $APP/preprocess/*.kt $APP/detect/*.kt $APP/solve/*.kt \
+        $APP/track/*.kt $APP/decide/*.kt $APP/nav/*.kt \
+        $T/SelftestMath.kt -include-runtime -d st_math.jar
+java -jar st_math.jar                      # 期望 49/49
 ```
+
+> Windows 控制台是 GBK：`java -jar xx.jar > out.txt 2>&1 && iconv -f GBK -t UTF-8 out.txt`
 
 ## 5. 比赛规则要点（第四届狼牙）
 
@@ -109,9 +129,27 @@ java -jar selftest.jar   # 期望 7/7 通过
 ## 6. 已知限制与后续
 
 - 目标物理尺寸与相机内参为估值，需实机标定（棋盘格 + 实测靶标）
-- 红外雷达数据未接入（FireController 雷达融合分支待启用）
-- 视觉管线待接入 CameraStreamer 帧源（ImageReader Surface 预留）
+- 红外雷达数据未接入：`radarDistanceMm` 传 -1 时融合自动退化为纯视觉；
+  接入后按 §1.7 逆方差加权生效，无需改调用点
+- 亚像素精定位依赖边缘对比度（阈值 20 灰阶），强逆光/严重失焦时
+  自动回退整数矩形（不变差，也不变准）
+- 视觉结果 UDP 31001 发送端未实现（APP 侧待办），视频链路已通
 - 导航待机械组完成机器人框架
+
+## 6.1 版本 0.6.0 的数学依据索引
+
+每条算法都能指回《传统视觉与深度学习视觉的数学基础》的具体章节：
+
+| 模块 | 依据 | 落地指标 |
+|---|---|---|
+| 可分离高斯 `Gaussian` | §4.2（可分离 / a=⌈3σ⌉ / 方差相加） | 自卷积误差 0.03% |
+| 导向滤波 `GuidedFilter` | §4.4 双边梯度反转 → §4.5 局部线性模型 | O(1)/像素，平坦区 σ 减半，无过冲 |
+| 色相环形 `Hsv` | §2.6（H 是环、S 在 V→0 不稳） | {359°,1°} 平均得 0° |
+| 亚像素尺寸 `SubpixelRect` | §10.4 + §4.7.1 先平滑再差分 | 尺寸误差 0.40px → 0.07px |
+| 检测框 NMS `Nms` | §11.2 IoU 贪心 | 重叠框去重 |
+| 结构张量 `StructureTensor` | §7.4 / §7.5（双角平均陷阱） | 边缘相干度 1.000 |
+| 卡尔曼门控 `KalmanFilterCV` | §1.7 高斯 + §9 协方差 | 400px 离群只扰动 3.3px |
+| 测距不确定度 `Pinhole` | §1.2 一阶泰勒 + §1.7 逆方差 | σ_d=(d/p)σ_p，融合 σ 800→76mm |
 
 ## 7. 协议文档
 

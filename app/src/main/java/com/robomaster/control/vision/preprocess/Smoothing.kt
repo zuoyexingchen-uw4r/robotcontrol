@@ -45,6 +45,12 @@ object Smoothing {
         val invSs = 1.0 / (2.0 * sigmaSpace * sigmaSpace)
         val invSc = 1.0 / (2.0 * sigmaColor * sigmaColor)
 
+        // 值域权重查表（数学基础 §2.7）：8 位灰度 → |v−center| 只有 0..255 共 256 种取值，
+        // 预先算好 exp 表就把内层循环里的 exp 全部换成一次数组索引（每像素 2×(2r+1) 次）。
+        val lut = DoubleArray(256) { d ->
+            exp(-(d * d).toDouble() * invSc)
+        }
+
         // 预计算空间权重表
         val spatial = DoubleArray((2 * radius + 1) * (2 * radius + 1))
         for (dy in -radius..radius) {
@@ -66,9 +72,7 @@ object Smoothing {
                 for (dx in -radius..radius) {
                     val nx = (x + dx).coerceIn(0, w - 1)
                     val v = gray[y * w + nx].toInt() and 0xFF
-                    val cw = exp(-((v - center) * (v - center)).toDouble() * invSc)
-                    val sw = spatial[radius * (2 * radius + 1) + (dx + radius)]
-                    val weight = cw * sw
+                    val weight = lut[Math.abs(v - center)] * spatial[radius * (2 * radius + 1) + (dx + radius)]
                     wsum += weight
                     vsum += weight * v
                 }
@@ -85,9 +89,7 @@ object Smoothing {
                 for (dy in -radius..radius) {
                     val ny = (y + dy).coerceIn(0, h - 1)
                     val v = tmp[ny * w + x]
-                    val cw = exp(-((v - center) * (v - center)).toDouble() * invSc)
-                    val sw = spatial[(dy + radius) * (2 * radius + 1) + radius]
-                    val weight = cw * sw
+                    val weight = lut[Math.abs(v - center)] * spatial[(dy + radius) * (2 * radius + 1) + radius]
                     wsum += weight
                     vsum += weight * v
                 }

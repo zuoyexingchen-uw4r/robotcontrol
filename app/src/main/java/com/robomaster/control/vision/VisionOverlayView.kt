@@ -8,6 +8,7 @@ import android.util.AttributeSet
 import android.view.View
 import com.robomaster.control.vision.decide.FireController
 import com.robomaster.control.vision.detect.TargetDetector
+import com.robomaster.control.vision.solve.Pinhole
 
 /**
  * 视觉检测结果叠加视图。
@@ -94,13 +95,22 @@ class VisionOverlayView @JvmOverloads constructor(
             canvas.drawRect(cx - half, cy - half, cx + half, cy + half, boxPaint)
             // 中心点
             canvas.drawCircle(cx, cy, 4f, boxPaint)
-            // 标注
+            // 朝向（高地靶面板长边方向，模 180°）
+            if (t.type == TargetDetector.Target.Type.HIGHLAND) {
+                val rad = Math.toRadians(t.orientationDeg)
+                val dx = (Math.cos(rad) * half).toFloat()
+                val dy = (Math.sin(rad) * half).toFloat()
+                canvas.drawLine(cx - dx, cy - dy, cx + dx, cy + dy, boxPaint)
+            }
+            // 标注：距离 ± 一阶传播的 1σ（不确定性直接标出来，才知道这一炮能不能打）
             val label = when (t.type) {
                 TargetDetector.Target.Type.HIGHLAND -> "高地靶"
                 TargetDetector.Target.Type.BASE -> "基地靶"
             }
+            val sigma = Pinhole.distanceSigma(t.distanceMm, t.pixelSize, 0.2)
+            val sigmaText = if (sigma > 0) "±${sigma.toInt()}" else "±?"
             canvas.drawText(
-                "$label ${t.distanceMm.toInt()}mm ${"%.1f".format(t.yawDeg)}°",
+                "$label ${t.distanceMm.toInt()}mm$sigmaText ${"%.1f".format(t.yawDeg)}°",
                 cx - half, cy - half - 8f, textPaint
             )
         }
@@ -115,7 +125,10 @@ class VisionOverlayView @JvmOverloads constructor(
             val vx = sx(t.cx + t.vx * 0.1) - cx
             val vy = sy(t.cy + t.vy * 0.1) - cy
             canvas.drawLine(cx, cy, cx + vx, cy + vy, trackPaint)
-            canvas.drawText("TRACK #${t.age}", cx + half + 6f, cy, textPaint)
+            // NIS 门控标记：! 表示本帧观测被马氏距离判为离群（已降权）
+            val flag = if (t.nisGated) " !" else ""
+            canvas.drawText("TRACK #${t.age} σ${"%.1f".format(t.trackSigmaPx)}$flag",
+                cx + half + 6f, cy, textPaint)
         }
 
         // ── 准星 + 开火容差圈 ──

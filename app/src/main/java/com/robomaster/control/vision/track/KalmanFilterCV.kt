@@ -13,11 +13,22 @@ import kotlin.math.sqrt
  *
  * 用途：目标检测结果的时序平滑——检测框有抖动/漏检时，
  * 用卡尔曼预测填补漏检帧、平滑跟踪轨迹，为枪管随动提供稳定角度。
+ *
+ * ## 2026-11 新增：NIS 软门控（数学基础 §1.7 / §9）
+ *
+ * 创新协方差 S = H·P·Hᵀ + R 已知时，马氏距离平方
+ *   d² = yᵀ·S⁻¹·y  ~  χ²(2)（模型正确、噪声为高斯）
+ * 自由度 2 的 99% 分位是 9.21。超过门限说明这条观测与运动模型不相容
+ * （典型来源：误检到别的目标、掩码被反光拉走）。
+ * 处理方式取**软门控**而非硬丢弃：按 d²/9.21 膨胀 R 再更新，
+ * 等价于"可信度按马氏距离打折"——既不会让一条离群观测把轨迹拽飞，
+ * 又能在目标真正机动时不至于跟丢（硬丢弃连续几帧就会丢线索）。
  */
 class KalmanFilterCV(
     private val dt: Double = 0.1,          // 帧间隔（秒），按检测频率调整
     processNoise: Double = 1.0,            // 过程噪声强度（加速度方差）
-    private val measurementNoise: Double = 4.0  // 测量噪声（像素方差）
+    private val measurementNoise: Double = 4.0,  // 测量噪声（像素方差）
+    private val gateNis: Double = GATE_99  // NIS 门限（χ²₂ 99% 分位 = 9.21）
 ) {
     // 状态 [x, y, vx, vy]
     private val x = DoubleArray(4)
@@ -53,6 +64,10 @@ class KalmanFilterCV(
     )
 
     var initialized = false
+        private set
+
+    /** 最近一次更新的 NIS（马氏距离平方）：模型相容时 ≈ 自由度 2；> 9.21 判为离群 */
+    var lastNis: Double = 0.0
         private set
 
     /** 用首次观测初始化 */
@@ -97,13 +112,13 @@ class KalmanFilterCV(
         }
     }
 
-    /** 更新（观测校正） */
-    fun update(mx: Double, my: Double) {
-        if (!initialized) { init(mx, my); return }
+    /** 更新（观测校正）。带 NIS 软门控，返回 false 表示该观测被判为离群（已降权）。 */
+    fun update(mx: Double, my: Double): Boolean {
+        if (!initialized) { init(mx, my); return true }
         // 创新 y = z - H·x
         val zx = mx - x[0]
         val zy = my - x[1]
-        // S = H·P·Hᵀ + R
+        // H·P（只算一次，S 在不同 R 缩放下复用）
         val ph = Array(2) { DoubleArray(4) }
         for (i in 0 until 2) {
             for (j in 0 until 4) {
@@ -112,12 +127,33 @@ class KalmanFilterCV(
                 ph[i][j] = s
             }
         }
-        val s00 = ph[0][0] + r[0][0]
-        val s01 = ph[0][1] + r[0][1]
-        val s10 = ph[1][0] + r[1][0]
-        val s11 = ph[1][1] + r[1][1]
+
+        // ── NIS 门控（§1.7 高斯 + §9 协方差）──
+        // d² = yᵀS⁻¹y 在模型正确时服从 χ²(2)；超过 99% 分位说明观测与预测不相容
+        val s00n = ph[0][0] + r[0][0]
+        val s01n = ph[0][1] + r[0][1]
+        val s10n = ph[1][0] + r[1][0]
+        val s11n = ph[1][1] + r[1][1]
+        val detN = s00n * s11n - s01n * s10n
+        if (abs(detN) < 1e-12) return false
+        val nis = (s11n * zx * zx - (s01n + s10n) * zx * zy + s00n * zy * zy) / detN
+        lastNis = nis
+        var accepted = true
+        var rScale = 1.0
+        if (gateNis > 0 && nis > gateNis) {
+            // 软门控：不丢观测（丢了会跟丢机动目标），而是按 nis/gate 膨胀 R，
+            // 等价于"这条观测的可信度按马氏距离打折"。
+            rScale = (nis / gateNis).coerceAtMost(MAX_INFLATE)
+            accepted = false
+        }
+
+        // S = H·P·Hᵀ + R·rScale
+        val s00 = ph[0][0] + r[0][0] * rScale
+        val s01 = ph[0][1] + r[0][1] * rScale
+        val s10 = ph[1][0] + r[1][0] * rScale
+        val s11 = ph[1][1] + r[1][1] * rScale
         val det = s00 * s11 - s01 * s10
-        if (abs(det) < 1e-12) return
+        if (abs(det) < 1e-12) return false
         val inv00 = s11 / det
         val inv01 = -s01 / det
         val inv10 = -s10 / det
@@ -133,7 +169,7 @@ class KalmanFilterCV(
         x[1] += k[1][0] * zx + k[1][1] * zy
         x[2] += k[2][0] * zx + k[2][1] * zy
         x[3] += k[3][0] * zx + k[3][1] * zy
-        // Joseph 形式：P = (I-KH)P(I-KH)ᵀ + KRKᵀ
+        // Joseph 形式：P = (I-KH)P(I-KH)ᵀ + K(R·rScale)Kᵀ
         val kh = Array(4) { DoubleArray(4) }
         for (i in 0 until 4) {
             for (j in 0 until 4) {
@@ -161,13 +197,11 @@ class KalmanFilterCV(
                 p[i][j] = s
             }
         }
-        // + K·R·Kᵀ
+        // + K·(R·rScale)·Kᵀ
         val kr = Array(4) { DoubleArray(2) }
         for (i in 0 until 4) {
             for (j in 0 until 2) {
-                var s = 0.0
-                for (m in 0 until 2) s += k[i][m] * r[m][j]
-                kr[i][j] = s
+                kr[i][j] = k[i][j] * r[j][j] * rScale
             }
         }
         for (i in 0 until 4) {
@@ -177,6 +211,7 @@ class KalmanFilterCV(
                 p[i][j] += s
             }
         }
+        return accepted
     }
 
     /** 当前位置（滤波后） */
@@ -193,4 +228,15 @@ class KalmanFilterCV(
 
     /** 位置协方差（不确定性，用于判断跟踪质量） */
     fun positionCovariance(): Double = sqrt(p[0][0] * p[1][1])
+
+    /** 位置标准差（像素，单轴平均）：σ = √(σx·σy) */
+    fun positionSigma(): Double = positionCovariance().coerceAtLeast(0.0)
+
+    companion object {
+        /** χ²(2) 的 99% 分位数：观测与预测不相容的判定门限 */
+        const val GATE_99 = 9.21
+
+        /** R 膨胀上限（防止发散） */
+        const val MAX_INFLATE = 64.0
+    }
 }

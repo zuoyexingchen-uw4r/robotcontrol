@@ -15,3 +15,7 @@ local.properties
 
 # HUD 本地 ffmpeg（大二进制，不入库；见 pc_hud/README.md）
 pc_hud/bin/
+
+# Python 缓存（HUD 运行产物，不入库）
+__pycache__/
+*.pyc

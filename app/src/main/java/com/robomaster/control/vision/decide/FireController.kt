@@ -30,7 +30,8 @@ object FireController {
         val frictionWheelDiameterMm: Double = 60.0,  // 摩擦轮直径 mm
         val yawToleranceDeg: Double = 1.5,      // 偏航容差（度）
         val pitchToleranceDeg: Double = 1.5,    // 俯仰容差（度）
-        val fireCooldownMs: Long = 500          // 开火冷却 ms
+        val fireCooldownMs: Long = 500,         // 开火冷却 ms
+        val maxRangeSigmaRel: Double = 0.25     // 测距相对不确定度上限（σ_d/d）
     )
 
     /** 开火指令 */
@@ -39,7 +40,9 @@ object FireController {
         val pitchDeg: Double,         // 枪管目标俯仰角（含弹道补偿）
         val frictionWheelRpm: Int,    // 摩擦轮目标转速 RPM
         val shouldFire: Boolean,      // 是否击发
-        val reason: String            // 决策说明（调试用）
+        val reason: String,           // 决策说明（调试用）
+        val distSigmaMm: Double = -1.0,  // 测距标准差（mm，-1=未知）
+        val radarWeight: Double = 0.0    // 融合中雷达的权重（0=纯视觉）
     )
 
     private var lastFireTime = 0L
@@ -53,6 +56,9 @@ object FireController {
      * @param radarDistanceMm 红外雷达测距（mm，-1=无效/未接入）
      * @param nowMs 当前时间戳（ms）
      * @param b 弹道参数
+     * @param pixelSize 目标像素尺寸（px，>0 时按一阶传播算 σ_d；否则按 10% 估）
+     * @param pixelSigmaPx 像素尺寸标准差（px，亚像素精定位后取 0.2 左右）
+     * @param radarSigmaMm 雷达测距标准差（mm，<0 按 1% 估）
      */
     fun compute(
         distanceMm: Double,
@@ -60,18 +66,35 @@ object FireController {
         pitchDeg: Double,
         radarDistanceMm: Double = -1.0,
         nowMs: Long = System.currentTimeMillis(),
-        b: Ballistics = Ballistics()
+        b: Ballistics = Ballistics(),
+        pixelSize: Double = -1.0,
+        pixelSigmaPx: Double = 0.5,
+        radarSigmaMm: Double = -1.0
     ): FireCommand {
-        // 雷达融合：雷达有效时加权校正（雷达更准，视觉更广）
-        val dist = if (radarDistanceMm > 0) {
-            radarDistanceMm * 0.7 + distanceMm * 0.3
+        // 视觉测距不确定度（§1.2 一阶传播）：σ_d = (d/p)·σ_p
+        val visSigma = if (pixelSize > 0) {
+            Pinhole.distanceSigma(distanceMm, pixelSize, pixelSigmaPx)
         } else {
-            distanceMm
+            if (distanceMm > 0) distanceMm * 0.10 else -1.0
         }
+
+        // 雷达融合（§1.7 逆方差加权：谁准听谁的，融合后方差必减小）
+        val fused = Pinhole.fuse(distanceMm, visSigma, radarDistanceMm, radarSigmaMm)
+        val dist = fused.distanceMm
+        val sigma = fused.sigmaMm
 
         // 射程检查
         if (dist <= 0 || dist > b.effectiveRangeMm) {
-            return FireCommand(yawDeg, pitchDeg, 0, false, "超射程 d=${dist.toInt()}mm")
+            return FireCommand(yawDeg, pitchDeg, 0, false,
+                "超射程 d=${dist.toInt()}mm", sigma, fused.radarWeight)
+        }
+
+        // 测距置信检查：相对不确定度太大时，弹道补偿本身就是噪声，不能击发
+        val relSigma = if (sigma > 0) sigma / dist else Double.MAX_VALUE
+        if (relSigma > b.maxRangeSigmaRel) {
+            return FireCommand(yawDeg, pitchDeg, 0, false,
+                "测距置信不足 σ/d=%.0f%% (d=%.0fmm σ=%.0fmm)"
+                    .format(relSigma * 100, dist, sigma), sigma, fused.radarWeight)
         }
 
         // 初速选择：距离越远初速越大（线性插值）
@@ -88,7 +111,10 @@ object FireController {
         val rpm = (60.0 * v / (PI * dM)).roundToInt()
 
         // 开火决策：角度容差 + 冷却
-        val angleOk = abs(yawDeg) < b.yawToleranceDeg && abs(pitchTotal) < b.pitchToleranceDeg
+        // 注意：容差判的是"枪口是否已经对准目标"（目标相对光轴的偏角），
+        // 不是判 pitchTotal——后者含弹道补偿（前馈量，6000mm 处约 3°），
+        // 拿补偿后的绝对角去比 1.5° 容差会永远超差。
+        val angleOk = abs(yawDeg) < b.yawToleranceDeg && abs(pitchDeg) < b.pitchToleranceDeg
         val cooled = nowMs - lastFireTime >= b.fireCooldownMs
         val shouldFire = angleOk && cooled
         if (shouldFire) lastFireTime = nowMs
@@ -96,9 +122,10 @@ object FireController {
         val reason = when {
             !angleOk -> "角度超差 yaw=%.1f pitch=%.1f".format(yawDeg, pitchTotal)
             !cooled -> "冷却中"
-            else -> "允许击发 d=${dist.toInt()}mm v=${"%.1f".format(v)}m/s"
+            else -> "允许击发 d=%.0fmm±%.0fmm v=%.1fm/s 雷达权重%.0f%%"
+                .format(dist, sigma, v, fused.radarWeight * 100)
         }
-        return FireCommand(yawDeg, pitchTotal, rpm, shouldFire, reason)
+        return FireCommand(yawDeg, pitchTotal, rpm, shouldFire, reason, sigma, fused.radarWeight)
     }
 
     /**

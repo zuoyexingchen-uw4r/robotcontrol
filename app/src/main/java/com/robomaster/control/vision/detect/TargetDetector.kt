@@ -29,6 +29,14 @@ import kotlin.math.PI
  * | minArea 随分辨率缩放 | 固定 30 在 1440×1080 上漏检远处小目标 | 大图 77 / 小图 30 |
  *
  * 灰灭灯板误燃率保持 0%（红掩码）/ 0.5%（蓝掩码）。
+ *
+ * ## 2026-11 数学基础驱动的改进（《传统视觉与深度学习视觉的数学基础》）
+ *
+ * | 改进 | 依据 | 解决什么 |
+ * |---|---|---|
+ * | 面板/圆靶尺寸亚像素精定位（[SubpixelRect]） | §10.4 三点抛物线拟合 + §4.7.1 先平滑再差分 | 整数矩形 ±0.5~1px 量化 → 7.5px 小目标上 7~13% 测距误差 |
+ * | 同色重叠框 NMS（[Nms]） | §11.2 IoU 贪心抑制 | 反光把圆靶切成多块时，卡尔曼在多观测间跳变 |
+ * | 组朝向双角平均（[StructureTensor]） | §7.5.3 角度周期 180°，算术平均会在 ±90° 跳变 | 4 面板朝向平均失真 |
  */
 object TargetDetector {
 
@@ -48,7 +56,8 @@ object TargetDetector {
         val distanceMm: Double,  // 测距（mm，-1=无效）
         val yawDeg: Double,      // 相对光轴偏航角（度，右为正）
         val pitchDeg: Double,    // 相对光轴俯仰角（度，上为正）
-        val confidence: Double   // 0-1
+        val confidence: Double,  // 0-1
+        val orientationDeg: Double = 0.0  // 目标朝向（度，模 180°；高地为面板长边方向）
     ) {
         enum class Type { HIGHLAND, BASE }
     }
@@ -81,12 +90,17 @@ object TargetDetector {
         val blobs = Components.label(cleaned, w, h, minArea = minArea)
 
         // 几何过滤：近似矩形的面板（用最小外接矩形，旋转不变）
+        // 2026-11：通过判据后用 SubpixelRect 把长/宽精定位到亚像素（§10.4），
+        //          尺寸相对误差 ≈ 测距相对误差，是弹道补偿能否可用的前提。
         val panels = ArrayList<Components.Blob>()
+        val rectMap = HashMap<Int, MinAreaRect.Rect>(blobs.size)
         for (b in blobs) {
-            val rect = rectOf(b) ?: continue
-            val rectness = b.area.toDouble() / (rect.length * rect.width)
-            if (rectness > RECTNESS_MIN && rect.length >= 8 && rect.width >= 8) {
+            val rect0 = rectOf(b) ?: continue
+            if (rect0.length < 8 || rect0.width < 8) continue
+            val rectness = b.area.toDouble() / (rect0.length * rect0.width)
+            if (rectness > RECTNESS_MIN) {
                 panels.add(b)
+                rectMap[b.label] = SubpixelRect.refine(img, w, h, rect0)
             }
         }
         if (panels.isEmpty()) return emptyList()
@@ -102,10 +116,10 @@ object TargetDetector {
             val cx = sx / g.size
             val cy = sy / g.size
             // 组尺寸（所有面板最小外接矩形四角点并集的轴对齐范围）
-            var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE
-            var maxX = Int.MIN_VALUE; var maxY = Int.MIN_VALUE
+            var minX = Double.MAX_VALUE; var minY = Double.MAX_VALUE
+            var maxX = -Double.MAX_VALUE; var maxY = -Double.MAX_VALUE
             for (b in g) {
-                val rect = rectOf(b) ?: continue
+                val rect = rectMap[b.label] ?: continue
                 forEachCorner(rect) { x, y ->
                     if (x < minX) minX = x
                     if (x > maxX) maxX = x
@@ -114,21 +128,27 @@ object TargetDetector {
                 }
             }
             if (minX > maxX || minY > maxY) continue
-            val pixelSize = maxOf(maxX - minX, maxY - minY).toDouble()
+            val pixelSize = maxOf(maxX - minX, maxY - minY)
             val dist = Pinhole.distance(pixelSize, HIGHLAND_PANEL_MM * 2, cam.focalPx)
             val dx = cx - w / 2.0
             val dy = cy - h / 2.0
             val (yaw, pitch) = Pinhole.angles(dx, dy, cam.focalPx)
+            // 组朝向：面板长边方向的双角平均（§7.5.3，角度是周期量，不能算术平均）
+            val angles = DoubleArray(g.size) { i ->
+                rectMap[g[i].label]?.angleDeg ?: 0.0
+            }
+            val orient = StructureTensor.meanOrientationPeriodPi(angles)
             targets.add(Target(
                 type = Target.Type.HIGHLAND,
                 cx = cx, cy = cy,
                 pixelSize = pixelSize,
                 distanceMm = dist,
                 yawDeg = yaw, pitchDeg = pitch,
-                confidence = (g.size / 4.0).coerceAtMost(1.0)
+                confidence = (g.size / 4.0).coerceAtMost(1.0),
+                orientationDeg = orient
             ))
         }
-        return targets
+        return Nms.greedy(targets, Nms.DEFAULT_IOU, { it.confidence }, ::boxOf)
     }
 
     /**
@@ -155,26 +175,29 @@ object TargetDetector {
 
         val targets = ArrayList<Target>()
         for (b in blobs) {
-            val rect = rectOf(b) ?: continue
-            val fill = b.area.toDouble() / (rect.length * rect.width)
-            val aspect = rect.length / rect.width
-            if (fill > FILL_MIN && abs(aspect - 1.0) < ASPECT_TOL && rect.length >= 10) {
-                val pixelSize = rect.length
+            val rect0 = rectOf(b) ?: continue
+            val fill = b.area.toDouble() / (rect0.length * rect0.width)
+            val aspect = rect0.length / rect0.width
+            if (fill > FILL_MIN && abs(aspect - 1.0) < ASPECT_TOL && rect0.length >= 10) {
+                // 亚像素精定位（§10.4）：圆靶两条边都是强梯度，长/宽都可信，取均值降噪
+                val rect = SubpixelRect.refine(img, w, h, rect0)
+                val pixelSize = (rect.length + rect.width) / 2.0
                 val dist = Pinhole.distance(pixelSize, BASE_TARGET_MM, cam.focalPx)
-                val dx = b.cx - w / 2.0
-                val dy = b.cy - h / 2.0
+                val dx = rect.cx - w / 2.0
+                val dy = rect.cy - h / 2.0
                 val (yaw, pitch) = Pinhole.angles(dx, dy, cam.focalPx)
                 targets.add(Target(
                     type = Target.Type.BASE,
-                    cx = b.cx, cy = b.cy,
+                    cx = rect.cx, cy = rect.cy,
                     pixelSize = pixelSize,
                     distanceMm = dist,
                     yawDeg = yaw, pitchDeg = pitch,
-                    confidence = fill
+                    confidence = fill,
+                    orientationDeg = rect.angleDeg
                 ))
             }
         }
-        return targets
+        return Nms.greedy(targets, Nms.DEFAULT_IOU, { it.confidence }, ::boxOf)
     }
 
     /** 面板空间聚类（简单贪心：距离近的归一组） */
@@ -210,8 +233,8 @@ object TargetDetector {
         return MinAreaRect.compute(px)
     }
 
-    /** 遍历最小外接矩形的 4 个角点（用于组尺寸并集） */
-    private inline fun forEachCorner(rect: MinAreaRect.Rect, action: (Int, Int) -> Unit) {
+    /** 遍历最小外接矩形的 4 个角点（亚像素，用于组尺寸并集） */
+    private inline fun forEachCorner(rect: MinAreaRect.Rect, action: (Double, Double) -> Unit) {
         val ang = Math.toRadians(rect.angleDeg)
         val ux = Math.cos(ang); val uy = Math.sin(ang)
         val vx = -uy; val vy = ux
@@ -219,11 +242,19 @@ object TargetDetector {
         val hw = rect.width / 2.0
         for (su in intArrayOf(-1, 1)) {
             for (sv in intArrayOf(-1, 1)) {
-                val x = Math.round(rect.cx + su * hl * ux + sv * hw * vx).toInt()
-                val y = Math.round(rect.cy + su * hl * uy + sv * hw * vy).toInt()
+                val x = rect.cx + su * hl * ux + sv * hw * vx
+                val y = rect.cy + su * hl * uy + sv * hw * vy
                 action(x, y)
             }
         }
+    }
+
+    /** 目标近似轴对齐框（NMS 用）：以检测中心为心、边长=pixelSize 的正方形 */
+    private fun boxOf(t: Target): IntArray {
+        val half = (t.pixelSize / 2.0).toInt()
+        val x = t.cx.toInt()
+        val y = t.cy.toInt()
+        return intArrayOf(x - half, y - half, x + half, y + half)
     }
 
     /**

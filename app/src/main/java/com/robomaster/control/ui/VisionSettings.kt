@@ -29,6 +29,17 @@ class VisionSettings private constructor(context: Context) {
         get() = sp.getBoolean("smoothing", false)
         set(v) = sp.edit().putBoolean("smoothing", v).apply()
 
+    /**
+     * 平滑算子选择：true = 导向滤波（O(1)，无光晕），false = 双边滤波。
+     *
+     * 依据（数学基础 §4.4/§4.5）：双边滤波非线性非移变、不能 FFT 加速，
+     * 且强边缘旁有梯度反转光晕；导向滤波用局部线性模型，O(1)/像素与半径无关。
+     * 预算紧张时保持开启。
+     */
+    var guidedFilterEnabled: Boolean
+        get() = sp.getBoolean("guided_filter", true)
+        set(v) = sp.edit().putBoolean("guided_filter", v).apply()
+
     /** 去辉光（强光干扰抑制：高光检测 + 修复） */
     var deglareEnabled: Boolean
         get() = sp.getBoolean("deglare", false)

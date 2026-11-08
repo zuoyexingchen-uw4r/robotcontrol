@@ -6,6 +6,7 @@ import com.robomaster.control.vision.detect.TargetDetector
 import com.robomaster.control.vision.nav.Navigation
 import com.robomaster.control.vision.preprocess.Deblur
 import com.robomaster.control.vision.preprocess.Deglare
+import com.robomaster.control.vision.preprocess.GuidedFilter
 import com.robomaster.control.vision.preprocess.Smoothing
 import com.robomaster.control.vision.track.KalmanFilterCV
 
@@ -46,7 +47,11 @@ class VisionPipeline(private val settings: VisionSettings) {
         val distanceMm: Double,
         val yawDeg: Double,
         val pitchDeg: Double,
-        val age: Int          // 跟踪帧数
+        val age: Int,         // 跟踪帧数
+        val pixelSize: Double = 0.0,     // 像素尺寸（亚像素精定位后）
+        val orientationDeg: Double = 0.0,// 目标朝向（模 180°）
+        val nisGated: Boolean = false,   // 本帧观测被 NIS 判为离群（已降权）
+        val trackSigmaPx: Double = 0.0   // 滤波后位置标准差（px，跟踪质量）
     )
 
     // 卡尔曼滤波器（每个目标类型一个）
@@ -96,7 +101,13 @@ class VisionPipeline(private val settings: VisionSettings) {
                 }
             }
             if (settings.smoothingEnabled) {
-                processed = Smoothing.bilateral(processed, w, h, radius = 2)
+                // 导向滤波 O(1)/像素、与半径无关、无梯度反转光晕（§4.5）；
+                // 关掉时退回双边滤波（保边更"硬"但代价随半径线性增长）
+                processed = if (settings.guidedFilterEnabled) {
+                    GuidedFilter.filter(processed, w, h, radius = 4, eps = 0.01)
+                } else {
+                    Smoothing.bilateral(processed, w, h, radius = 2)
+                }
             }
             if (settings.deglareEnabled) {
                 processed = Deglare.process(processed, w, h)
@@ -132,7 +143,7 @@ class VisionPipeline(private val settings: VisionSettings) {
                 TargetDetector.Target.Type.BASE -> baseKf
             }
             kf.predict()
-            kf.update(best.cx, best.cy)
+            val accepted = kf.update(best.cx, best.cy)
             val (px, py) = kf.position()
             val (vx, vy) = kf.velocity()
             trackedAge++
@@ -143,7 +154,11 @@ class VisionPipeline(private val settings: VisionSettings) {
                 distanceMm = best.distanceMm,
                 yawDeg = best.yawDeg,
                 pitchDeg = best.pitchDeg,
-                age = trackedAge
+                age = trackedAge,
+                pixelSize = best.pixelSize,
+                orientationDeg = best.orientationDeg,
+                nisGated = !accepted,
+                trackSigmaPx = kf.positionSigma()
             )
         } else {
             trackedAge = 0
@@ -155,7 +170,10 @@ class VisionPipeline(private val settings: VisionSettings) {
             fireCmd = FireController.compute(
                 distanceMm = tracked.distanceMm,
                 yawDeg = tracked.yawDeg,
-                pitchDeg = tracked.pitchDeg
+                pitchDeg = tracked.pitchDeg,
+                // 亚像素精定位后像素尺寸标准差约 0.2px（整数矩形为 0.5px）
+                pixelSize = tracked.pixelSize,
+                pixelSigmaPx = 0.2
                 // radarDistanceMm 待红外雷达接入后传入
             )
         }
