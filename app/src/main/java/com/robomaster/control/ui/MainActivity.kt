@@ -132,6 +132,9 @@ class MainActivity : AppCompatActivity() {
         // 图传一键启停（用第二屏记忆的配置）
         binding.btnVideo.setOnClickListener { toggleVideo() }
 
+        // IP 切换：循环切槽位 R1/R2/B1/B2，通知 PC 脚本改 IP 并重连
+        binding.btnSwitchIp.setOnClickListener { switchRobotSlot() }
+
         // 电源开关
         binding.btnTypec1.setOnClickListener {
             vm.powerSwitch(1, !binding.btnTypec1.isActivated)
@@ -306,16 +309,59 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             com.robomaster.control.laser.LaserBridgeService.start(
-                this, s.host, s.laserBaud, s.laserMode
+                this, s.host, s.laserBaud
             )
             laserRunning = true
             binding.btnLaser.text = "停止激光桥"
-            log("[激光] 启动混合桥 → ${s.host} (baud=${s.laserBaud} mode=${s.laserMode})")
+            log("[激光] 启动混合桥 → ${s.host} (baud=${s.laserBaud})")
         } else {
             stopService(android.content.Intent(this, com.robomaster.control.laser.LaserBridgeService::class.java))
             laserRunning = false
             binding.btnLaser.text = "激光桥"
             log("[激光] 已停止")
+        }
+    }
+
+    // ── 机器人槽位切换（改本机 IP + 重连） ──
+    private var slotIndex = -1
+
+    /** 循环切换到下一个槽位，通知 PC 脚本改 IP，并重开图传/激光端口 */
+    private fun switchRobotSlot() {
+        val slots = com.robomaster.control.laser.RobotSlots.SLOTS
+        slotIndex = (slotIndex + 1) % slots.size
+        val slot = slots[slotIndex]
+        val s = Settings.get(this)
+        s.robotId = slot.robotId
+        s.robotIp = slot.ip
+        binding.btnSwitchIp.text = "IP:${slot.slot}"
+        log("[IP] 切换槽位 ${slot.slot} ${slot.label} → ${slot.ip} (${slot.robotId})")
+
+        // 1) 通知 PC 脚本（adb 打开）改 IP：UDP 广播 "switch_ip <robot_id>"
+        sendSwitchIpRequest(slot.robotId)
+
+        // 2) 重开图传端口 + 重连：先停再按新 IP 重建
+        stopVideo()
+        // 3) 重启激光桥（TCP 会按新 IP 自动重连）
+        if (laserRunning) {
+            stopService(android.content.Intent(this, com.robomaster.control.laser.LaserBridgeService::class.java))
+            com.robomaster.control.laser.LaserBridgeService.start(this, s.host, s.laserBaud)
+        }
+        toast("已切换 ${slot.slot} ${slot.label} ${slot.ip}，正在重连")
+    }
+
+    /** 把切 IP 指令广播给 PC 端 switch_ip.sh --listen（端口 8769） */
+    private fun sendSwitchIpRequest(robotId: String) {
+        try {
+            java.net.DatagramSocket().use { ds ->
+                ds.broadcast = true
+                val payload = "switch_ip $robotId".toByteArray(Charsets.UTF_8)
+                ds.send(java.net.DatagramPacket(
+                    payload, payload.size,
+                    java.net.InetAddress.getByName("255.255.255.255"), 8769,
+                ))
+            }
+        } catch (e: Exception) {
+            log("[IP] 通知 PC 脚本失败: ${e.message}")
         }
     }
 

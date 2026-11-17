@@ -13,27 +13,21 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 
 /**
- * 激光雷达 + 主控板混合桥（手机 USB-host 适度解析 → TCP/UDP → 上位机）。
+ * 激光雷达 + 主控板混合桥（手机 USB-host 适度解析 → UDP+FEC / TCP → 上位机）。
  *
- * 架构：ESP32 经 UART 把「雷达 60 字节帧 + 主控 60 字节帧」混在一起发到 CH343，
- * 本桥从 USB 串口读出字节流 → [LaserStreamFramer] 切帧（不解析内容）→ 打 1 字节
- * 类型头 → 串进 TCP/UDP 管道。下行主控帧（上位机→手机）打 [LaserProtocol.T_MASTER_DOWN]
- * 头透传下 UART，手机同样不解析。
+ * 传输（不重传）：
+ * - **上行（雷达 + 主控遥测）走 UDP + Reed-Solomon FEC**：块 = k 数据分片 + m 校验分片，
+ *   丢失 ≤m 个分片可由擦除解码恢复，无重传延迟。
+ * - **下行（主控指令）走 TCP**：命令低频且关键，可靠传输（唯一保留的可靠通道）。
  *
- * **USB 自动重连**：独立监督协程监控 [UsbSerialTransport.state]，断开后自动重连
- * （连接失败按 [reconnectMs] 重试）。极端工况下配合无障碍服务/前台服务兜底。
- *
- * **传输自适应**（不重传，坏帧靠 CRC/seq 丢弃感知）：
- * - [TransportMode.TCP]：雷达+主控都走 TCP（可靠，主控指令不丢）。
- * - [TransportMode.UDP]：雷达走 UDP（低延迟、可丢），主控走 TCP。
- * - [TransportMode.AUTO]：TCP 正常时全走 TCP；TCP 掉线时雷达自动降级 UDP。
+ * **USB 自动重连**：监督协程监控 [UsbSerialTransport.state]，断开后自动重连。
+ * 极端工况下配合前台服务 + 无障碍服务 + adb shell 脚本三保险兜底。
  */
 class LaserBridge(
     private val context: Context,
@@ -43,38 +37,39 @@ class LaserBridge(
     private val udpPort: Int = LaserProtocol.UDP_PORT,
     private val baudRate: Int = 230_400,   // 雷达 230400，CH343 ≥ 此值
     private val reconnectMs: Long = 1500L,
+    private val fecK: Int = LaserProtocol.FEC_K,
+    private val fecM: Int = LaserProtocol.FEC_M,
 ) {
-    enum class TransportMode { AUTO, TCP, UDP }
-
-    var mode: TransportMode = TransportMode.AUTO
     var onLog: (String) -> Unit = {}
-    /** (type, frame) 上行帧回调：type ∈ T_MASTER_UP/T_LIDAR，frame 为 60 字节 */
+    /** (type, frame) 上行帧回调：type ∈ T_MASTER_UP/T_LIDAR */
     var onUpFrame: ((Int, ByteArray) -> Unit)? = null
-    /** 下行主控帧回调（上位机→手机，已去掉类型头，60 字节） */
+    /** 下行主控帧回调（上位机→手机，39 字节） */
     var onDownFrame: ((ByteArray) -> Unit)? = null
+    /** 收到「切 IP」预留 UART 帧（赛前设置），参数为目标 IP */
+    var onSwitchIpRequest: ((String) -> Unit)? = null
 
     @Volatile private var running = false
     private val transport = UsbSerialTransport(context, scope, baudRate)
     private val framer = LaserStreamFramer()
+    private val fec = LaserFecEncoder(fecK, fecM)
 
     private var tcp: TcpChannel? = null
     private var udp: DatagramSocket? = null
     private val udpLock = Any()
     private val downBuf = ByteArrayOutputStream()
 
-    /** 网络(TCP)连接状态 */
     val tcpConnected = MutableStateFlow(false)
 
     fun start() {
         if (running) return
         running = true
-
         startTcp()
         startUdp()
         scope.launch { supervise() }
         scope.launch(Dispatchers.IO) {
             transport.incoming.onEach { onUsbBytes(it) }.launchIn(this)
         }
+        scope.launch { flushLoop() }
     }
 
     fun stop() {
@@ -84,9 +79,9 @@ class LaserBridge(
         scope.launch { runCatching { transport.disconnect() } }
     }
 
-    // ── 网络：TCP（可靠，主控上下行 + 雷达主力） ──
+    // ── 网络：TCP（仅下行主控指令，可靠） ──
     private fun startTcp() {
-        tcp = TcpChannel(scope, host, tcpPort, label = "激光混合").apply {
+        tcp = TcpChannel(scope, host, tcpPort, label = "激光下行").apply {
             onLog = this@LaserBridge.onLog
             onData = { bytes -> onNetworkBytes(bytes) }
             onState = { ok ->
@@ -97,9 +92,8 @@ class LaserBridge(
         tcp?.start()
     }
 
-    // ── 网络：UDP（雷达旁路，低延迟） ──
+    // ── 网络：UDP（上行雷达+主控，FEC） ──
     private fun startUdp() {
-        if (mode == TransportMode.TCP) return
         synchronized(udpLock) {
             if (udp != null) return
             udp = try {
@@ -126,9 +120,7 @@ class LaserBridge(
                 try {
                     onLog("[激光] 连接 CH343 (baud=$baudRate) …")
                     transport.connect()
-                    if (transport.state.value is ConnState.Connected) {
-                        onLog("[激光] USB 已连接")
-                    }
+                    if (transport.state.value is ConnState.Connected) onLog("[激光] USB 已连接")
                 } catch (e: Exception) {
                     if (running) {
                         onLog("[激光] USB 连接失败: ${e.message}，${reconnectMs}ms 后重试")
@@ -139,7 +131,15 @@ class LaserBridge(
         }
     }
 
-    // ── 上行：USB 字节流 → 切帧 → 打类型头 → 网络 ──
+    // ── 尾部残块定时冲刷（低延迟，不凑满整块也发） ──
+    private suspend fun flushLoop() {
+        while (running) {
+            delay(5)
+            fec.flush()?.let { sendFecPackets(it) }
+        }
+    }
+
+    // ── 上行：USB 字节流 → 切帧 → FEC 编码 → UDP ──
     private fun onUsbBytes(bytes: ByteArray) {
         val frames = ArrayList<LaserStreamFramer.Frame>(4)
         framer.feed(bytes, frames)
@@ -148,59 +148,48 @@ class LaserBridge(
                 LaserStreamFramer.FrameType.LIDAR -> LaserProtocol.T_LIDAR
                 LaserStreamFramer.FrameType.MASTER -> LaserProtocol.T_MASTER_UP
             }
-            onUpFrame?.invoke(type, f.bytes)
-            routeUp(type, f.bytes)
-        }
-    }
-
-    private fun routeUp(type: Int, frame: ByteArray) {
-        when (type) {
-            LaserProtocol.T_MASTER_UP -> {
-                // 主控帧必须可靠：仅 TCP
-                if (tcpConnected.value) tcp?.send(LaserProtocol.wrap(type, frame))
-            }
-            LaserProtocol.T_LIDAR -> {
-                when (mode) {
-                    TransportMode.TCP -> if (tcpConnected.value) tcp?.send(LaserProtocol.wrap(type, frame))
-                    TransportMode.UDP -> sendUdp(frame)
-                    TransportMode.AUTO ->
-                        if (tcpConnected.value) tcp?.send(LaserProtocol.wrap(type, frame))
-                        else sendUdp(frame)
+            if (type == LaserProtocol.T_MASTER_UP) {
+                RobotSlots.parseSwitchIpFrame(f.bytes)?.let { ip ->
+                    onLog("[激光] 收到切 IP 帧 → $ip")
+                    onSwitchIpRequest?.invoke(ip)
                 }
             }
+            onUpFrame?.invoke(type, f.bytes)
+            fec.push(type, f.bytes)?.let { sendFecPackets(it) }
         }
     }
 
-    private fun sendUdp(frame: ByteArray) {
+    private fun sendFecPackets(packets: List<LaserFecEncoder.Packet>) {
         val s = synchronized(udpLock) { udp } ?: return
         synchronized(udpLock) {
             try {
-                val payload = LaserProtocol.wrap(LaserProtocol.T_LIDAR, frame)
-                s.send(DatagramPacket(payload, payload.size, InetAddress.getByName(host), udpPort))
+                val addr = InetAddress.getByName(host)
+                for (p in packets) {
+                    s.send(DatagramPacket(p.bytes, p.bytes.size, addr, udpPort))
+                }
             } catch (_: Exception) {
-                // UDP 发送失败静默丢弃（不重传）
+                // UDP 发送失败静默丢弃（FEC 已提供冗余，不重传）
             }
         }
     }
 
-    // ── 下行：网络字节 → [type][60B] 重组 → 主控下行帧透传下 UART ──
+    // ── 下行：TCP 字节 → [type][frame] 重组 → 主控下行帧透传下 UART ──
     private fun onNetworkBytes(bytes: ByteArray) {
         downBuf.write(bytes)
         val buf = downBuf.toByteArray()
         downBuf.reset()
         var i = 0
-        while (i + 1 + LaserProtocol.FRAME_LEN <= buf.size) {
+        while (i + 1 + LaserProtocol.MASTER_FRAME_LEN <= buf.size) {
             val type = buf[i].toInt() and 0xFF
-            val frame = buf.copyOfRange(i + 1, i + 1 + LaserProtocol.FRAME_LEN)
+            val frame = buf.copyOfRange(i + 1, i + 1 + LaserProtocol.MASTER_FRAME_LEN)
             when (type) {
                 LaserProtocol.T_MASTER_DOWN -> {
                     onDownFrame?.invoke(frame)
-                    // 透传下 UART（原样，不解析）
                     scope.launch { runCatching { transport.send(frame) } }
                 }
-                else -> { /* 未知类型，跳过 1 字节重找 */ }
+                else -> { /* 未知类型，滑 1 字节重找 */ }
             }
-            i += 1 + LaserProtocol.FRAME_LEN
+            i += 1 + LaserProtocol.MASTER_FRAME_LEN
         }
         if (i < buf.size) downBuf.write(buf, i, buf.size - i)
     }

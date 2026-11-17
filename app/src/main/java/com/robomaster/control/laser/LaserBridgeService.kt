@@ -45,17 +45,37 @@ class LaserBridgeService : Service() {
             return START_STICKY
         }
         val baud = intent?.getIntExtra("baud", s.laserBaud) ?: s.laserBaud
-        val mode = LaserBridge.TransportMode.values().getOrElse(
-            intent?.getIntExtra("mode", s.laserMode) ?: s.laserMode
-        ) { LaserBridge.TransportMode.AUTO }
 
         bridge?.stop()
         bridge = LaserBridge(this, scope, host, baudRate = baud).apply {
-            this.mode = mode
             onLog = { log -> sendLogToUi(log) }
+            onSwitchIpRequest = { ip -> handleSwitchIp(ip) }
         }
         bridge?.start()
         return START_STICKY
+    }
+
+    /** 收到「切 IP」预留 UART 帧：保存槽位 + 通知 PC 脚本改 IP */
+    private fun handleSwitchIp(ip: String) {
+        val slot = RobotSlots.byIp(ip)
+        val s = Settings.get(this)
+        if (slot != null) {
+            s.robotId = slot.robotId
+            s.robotIp = slot.ip
+        } else {
+            s.robotIp = ip
+        }
+        try {
+            java.net.DatagramSocket().use { ds ->
+                ds.broadcast = true
+                val robotId = slot?.robotId ?: ip
+                val payload = "switch_ip $robotId".toByteArray(Charsets.UTF_8)
+                ds.send(java.net.DatagramPacket(
+                    payload, payload.size,
+                    java.net.InetAddress.getByName("255.255.255.255"), 8769,
+                ))
+            }
+        } catch (_: Exception) { }
     }
 
     private fun sendLogToUi(log: String) {
@@ -99,9 +119,9 @@ class LaserBridgeService : Service() {
         private const val CHANNEL_ID = "laser_bridge"
         private const val NOTIF_ID = 1001
 
-        fun start(ctx: android.content.Context, host: String, baud: Int, mode: Int) {
+        fun start(ctx: android.content.Context, host: String, baud: Int) {
             val i = Intent(ctx, LaserBridgeService::class.java)
-                .putExtra("host", host).putExtra("baud", baud).putExtra("mode", mode)
+                .putExtra("host", host).putExtra("baud", baud)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(i)
             } else {

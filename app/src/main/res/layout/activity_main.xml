@@ -136,6 +136,17 @@
                     android:paddingLeft="14dp"
                     android:paddingRight="14dp" />
 
+                <Button
+                    android:id="@+id/btnSwitchIp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="IP:R1"
+                    android:textSize="13sp"
+                    android:minWidth="0dp"
+                    android:minHeight="0dp"
+                    android:paddingLeft="14dp"
+                    android:paddingRight="14dp" />
+
                 <TextView
                     android:id="@+id/tvCh343"
                     android:layout_width="0dp"

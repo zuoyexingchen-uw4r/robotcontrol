@@ -91,10 +91,15 @@ class Settings private constructor(context: Context) {
         get() = sp.getInt("laser_baud", 230400)
         set(v) = sp.edit().putInt("laser_baud", v).apply()
 
-    /** 激光桥传输模式：0=AUTO 1=TCP 2=UDP */
-    var laserMode: Int
-        get() = sp.getInt("laser_mode", 0)
-        set(v) = sp.edit().putInt("laser_mode", v.coerceIn(0, 2)).apply()
+    /** 机器人 ID（槽位，默认 R1 红方射击） */
+    var robotId: String
+        get() = sp.getString("robot_id", "red_r1") ?: "red_r1"
+        set(v) = sp.edit().putString("robot_id", v).apply()
+
+    /** 机器人 IP（随 robotId 联动，切换后本机静态 IP） */
+    var robotIp: String
+        get() = sp.getString("robot_ip", "192.168.1.3") ?: "192.168.1.3"
+        set(v) = sp.edit().putString("robot_ip", v).apply()
 
     companion object {
         @Volatile private var inst: Settings? = null
