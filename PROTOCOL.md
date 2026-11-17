@@ -169,9 +169,14 @@ HUD 用 ffmpeg 子进程解码：`-flags low_delay` + `udp://...?fifo_size=83886
 
 - **权威源是手机 SharedPreferences**：电脑改 → `set_req` 发手机 → 手机写入 →
   下一次 `settings` 广播全量确认 → 电脑刷新 UI。电脑乐观更新 + 快照校验。
-- `vision` 帧 JSON：`{t, ts, fps, lat_ms, targets[], track{}, fire{}, proc_ms{}}`。
+- `vision` 帧 JSON：`{t, ts, fps, lat_ms, frame_w, frame_h, targets[], track{}, fire{}, proc_ms{}}`。
   targets 元素 `{type: highland|base, cx, cy, w, h, conf}`，坐标为手机视觉
-  基准分辨率（640×480）像素；track 含 `vx/vy/dist_mm/yaw_deg/pitch_deg`。
+  基准分辨率（默认 640×480，但以帧内 `frame_w`/`frame_h` 为准——v0.6.1 起
+  视觉会话跟随图传分辨率，不再写死）；track 含 `vx/vy/dist_mm/yaw_deg/pitch_deg`。
+- **v0.6.1 已实现手机端发送**：`vision/VisionUdpLink.kt` 绑定 31002 收 `hello`/`set_req`
+  并回广播 `settings`，同时经同一 socket 广播 `vision`；远程设置仅接受白名单键 +
+  类型校验（`VisionSettings.applyRemote`）。视觉结果只在管线真正重算的帧广播，
+  节流复用帧不重复发送、不重复开火。
 
 ### 3. 操作输入 + 遥测（WLAN TCP，电脑直连 ESP32-S3）
 

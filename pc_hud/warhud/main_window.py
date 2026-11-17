@@ -223,9 +223,8 @@ class MainWindow(QMainWindow):
         self.hud.vision_alive = self.phone.vision_alive
         self.hud.esp32_alive = self.esp32.connected and self.esp32.telem_age_ms < 1000
         self.hud.telem_alive = self.esp32.telem_age_ms < 1000
-        if self.phone.vision:
-            self.hud.vision_fps = self.phone.vision_frames / max(0.1, 2.0) \
-                if self.phone.settings_age_ms >= 0 else 0
+        # 视觉帧率：由收包线程在收到 vision 时滑动计算，避免用累计帧数越涨越高
+        self.hud.vision_fps = self.phone.vision_fps
         self.lbl_phone_ip.setText(f"手机：{self.phone.phone_ip or '--'}"
                                   f"   视觉帧：{self.phone.vision_frames}")
         self.lbl_sync_state.setText(

@@ -1,6 +1,8 @@
 package com.robomaster.control.ui
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.hardware.camera2.CameraManager
 import android.os.Bundle
@@ -9,12 +11,15 @@ import android.view.View
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.robomaster.control.databinding.ActivityMainBinding
 import com.robomaster.control.video.CameraStreamer
 import com.robomaster.control.video.EncoderMode
 import com.robomaster.control.vision.VisionCamera
 import com.robomaster.control.vision.VisionPipeline
+import com.robomaster.control.vision.VisionUdpLink
 import kotlinx.coroutines.launch
 
 /**
@@ -39,6 +44,15 @@ class MainActivity : AppCompatActivity() {
     private var visionCamera: VisionCamera? = null
     private var visionThread: android.os.HandlerThread? = null
     private var visionPipeline: VisionPipeline? = null
+    private var visionLink: VisionUdpLink? = null
+
+    private val camPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            if (streamer == null) toggleVideo()
+        } else {
+            toast("相机权限被拒绝，无法启动图传与视觉")
+        }
+    }
 
     /** 视觉分析帧率（独立于图传，低于图传帧率减轻 CPU 负担） */
     private val visionFps = 15
@@ -57,6 +71,9 @@ class MainActivity : AppCompatActivity() {
         observe()
         setupControls()
         checkCh343()
+        visionLink = VisionUdpLink(VisionSettings.get(this)) { msg ->
+            runOnUiThread { if (!isDestroyed) log("[视觉同步] $msg") }
+        }.also { it.start() }
     }
 
     private fun observe() {
@@ -141,6 +158,10 @@ class MainActivity : AppCompatActivity() {
             stopVideo()
             return
         }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            camPerm.launch(Manifest.permission.CAMERA)
+            return
+        }
         val s = Settings.get(this)
         if (s.host.isBlank()) {
             toast("请先到第二屏配置电脑 IP")
@@ -198,8 +219,11 @@ class MainActivity : AppCompatActivity() {
                         // 第二会话帧：YUV→RGB → 视觉管线（OpenCV 接入时可替换此步）
                         val rgb = VisionCamera.yuv420ToRgb(image, s.resW, s.resH)
                         val result = visionPipeline?.process(rgb, s.resW, s.resH) ?: return@VisionCamera
+                        // 只有真正重算的帧才广播视觉结果；节流帧复用旧结果，禁止重复开火。
+                        if (result.processed) {
+                            visionLink?.sendVision(result, s.resW, s.resH, visionFps.toFloat())
+                        }
                         runOnUiThread {
-                            // 更新检测叠加视图
                             binding.visionOverlay.update(result, s.resW, s.resH)
                             val t = result.trackedTarget
                             if (t != null) {
@@ -209,13 +233,15 @@ class MainActivity : AppCompatActivity() {
                                     t.distanceMm.toInt(), t.yawDeg
                                 )
                             }
-                            result.fireCommand?.let { fc ->
-                                if (fc.shouldFire) {
-                                    // 开火指令经 USB 直连下位机（帧格式见 FireController.serialize）
-                                    vm.sendVisionCommand(
-                                        com.robomaster.control.vision.decide.FireController.serialize(fc)
-                                    )
-                                    log("[视觉] 开火! ${fc.reason}")
+                            if (result.processed) {
+                                result.fireCommand?.let { fc ->
+                                    if (fc.shouldFire) {
+                                        // 开火指令经 USB 直连下位机（帧格式见 FireController.serialize）
+                                        vm.sendVisionCommand(
+                                            com.robomaster.control.vision.decide.FireController.serialize(fc)
+                                        )
+                                        log("[视觉] 开火! ${fc.reason}")
+                                    }
                                 }
                             }
                         }
@@ -254,6 +280,7 @@ class MainActivity : AppCompatActivity() {
         visionThread = null
         visionPipeline?.reset()
         visionPipeline = null
+        visionLink?.stop()
         binding.btnVideo.text = "图传启停"
         binding.tvFps.text = "FPS 0.0"
         log("[UI] 图传已停止")
@@ -267,6 +294,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         stopVideo()
+        visionLink?.stop()
+        visionLink = null
         super.onDestroy()
     }
 }

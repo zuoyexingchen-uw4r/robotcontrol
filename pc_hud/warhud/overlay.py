@@ -64,12 +64,21 @@ class HudOverlay:
     def paint(self, p: QPainter, w: int, h: int) -> None:
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        # 手机视觉基准分辨率（检测框坐标来源）
-        base_w, base_h = 640.0, 480.0
-        sx, sy = w / base_w, h / base_h
+        # 检测框坐标来自手机视觉基准分辨率；若手机在 vision 里带了
+        # frame_w/frame_h 则以其为准，否则回退到 640×480。
+        v = self.vision
+        base_w = float(v.get("frame_w", 640)) if v else 640.0
+        base_h = float(v.get("frame_h", 480)) if v else 480.0
+        if base_w <= 0 or base_h <= 0:
+            base_w, base_h = 640.0, 480.0
+        # 视频画面按保持宽高比居中缩放，检测框要与画面同映射：
+        # 先算画面缩放后的偏移，再套检测框。
+        scale = min(w / base_w, h / base_h)
+        off_x = (w - base_w * scale) / 2.0
+        off_y = (h - base_h * scale) / 2.0
 
         if self.show_detect:
-            self._draw_detections(p, sx, sy)
+            self._draw_detections(p, scale, off_x, off_y)
         self._draw_crosshair(p, w, h)
         if self.show_panel:
             self._draw_status_panel(p, w, h)
@@ -80,13 +89,20 @@ class HudOverlay:
 
     # ─────────── 检测框 / 追踪框 ───────────
 
-    def _draw_detections(self, p: QPainter, sx: float, sy: float) -> None:
+    def _draw_detections(self, p: QPainter, scale: float, off_x: float, off_y: float) -> None:
         v = self.vision
         if not v:
             return
+
+        def mx(x: float) -> float:
+            return off_x + x * scale
+
+        def my(y: float) -> float:
+            return off_y + y * scale
+
         for t in v.get("targets", []):
-            cx, cy = t.get("cx", 0) * sx, t.get("cy", 0) * sy
-            tw, th = t.get("w", 40) * sx, t.get("h", 40) * sy
+            cx, cy = mx(t.get("cx", 0)), my(t.get("cy", 0))
+            tw, th = t.get("w", 40) * scale, t.get("h", 40) * scale
             color = QColor(self.cfg["detect_color"] if t.get("type") == "base"
                            else "#32D74B")
             p.setPen(QPen(color, 2))
@@ -97,7 +113,7 @@ class HudOverlay:
 
         tr = v.get("track")
         if tr:
-            cx, cy = tr.get("cx", 0) * sx, tr.get("cy", 0) * sy
+            cx, cy = mx(tr.get("cx", 0)), my(tr.get("cy", 0))
             vx, vy = tr.get("vx", 0), tr.get("vy", 0)
             p.setPen(QPen(QColor(self.cfg["track_color"]), 2, Qt.DashLine))
             r = 26
@@ -105,7 +121,7 @@ class HudOverlay:
             # 速度矢量（预测 0.5s 位置）
             p.setPen(QPen(QColor(self.cfg["track_color"]), 2))
             p.drawLine(QPointF(cx, cy),
-                       QPointF(cx + vx * 0.5 * sx, cy + vy * 0.5 * sy))
+                       QPointF(cx + vx * 0.5 * scale, cy + vy * 0.5 * scale))
             p.setFont(self._font_b)
             dist = tr.get("dist_mm")
             if dist:

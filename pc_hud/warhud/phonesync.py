@@ -34,6 +34,8 @@ class PhoneSync:
         self.settings_age_ms = 1e9
         self.phone_ip = ""                # 收到广播后自动记住
         self.vision_frames = 0
+        # 视觉帧率滑动窗口（收到 vision 时采样，避免累计帧数越涨越高）
+        self._vision_ts: list[float] = []
 
         # 回调（由 UI 层赋值，Qt 信号或直接调用）
         self.on_vision = None             # (dict) -> None
@@ -97,6 +99,10 @@ class PhoneSync:
                     self.vision = msg
                     self.vision_age_ms = 0.0
                     self.vision_frames += 1
+                    now_m = time.monotonic()
+                    self._vision_ts.append(now_m)
+                    # 只保留最近 2 秒内的采样
+                    self._vision_ts = [ts for ts in self._vision_ts if now_m - ts <= 2.0]
                     if self.on_vision:
                         self.on_vision(msg)
                 elif t == "settings":
@@ -132,6 +138,16 @@ class PhoneSync:
     @property
     def vision_alive(self) -> bool:
         return self.vision_age_ms < 1000
+
+    @property
+    def vision_fps(self) -> float:
+        """最近 2 秒视觉帧滑动窗口估算的帧率（无帧或只有一帧时返回 0）。"""
+        if len(self._vision_ts) < 2:
+            return 0.0
+        span = self._vision_ts[-1] - self._vision_ts[0]
+        if span <= 0:
+            return 0.0
+        return (len(self._vision_ts) - 1) / span
 
     @property
     def settings_alive(self) -> bool:

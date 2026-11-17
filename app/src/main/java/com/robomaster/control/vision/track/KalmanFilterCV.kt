@@ -83,6 +83,14 @@ class KalmanFilterCV(
         initialized = true
     }
 
+    /** 清空轨迹；重新启动视觉会话或切换场景时使用。 */
+    fun reset() {
+        x.fill(0.0)
+        p.forEach { it.fill(0.0) }
+        lastNis = 0.0
+        initialized = false
+    }
+
     /** 预测（时间推进） */
     fun predict() {
         if (!initialized) return

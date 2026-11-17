@@ -69,26 +69,37 @@ class VisionCamera(
                 listOf<Surface>(reader!!.surface),
                 object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: android.hardware.camera2.CameraCaptureSession) {
-                        session = s
-                        val req = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                            addTarget(reader!!.surface)
-                            // 独立帧率：视觉分析可跑低于图传的帧率，减轻 CPU 负担
-                            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
-                            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                        }.build()
-                        s.setRepeatingRequest(req, null, handler)
-                        Log.i(TAG, "视觉第二会话就绪 ${width}x${height}@${fps}")
+                        val currentReader = reader
+                        if (!running || currentReader == null) {
+                            s.close()
+                            return
+                        }
+                        try {
+                            session = s
+                            val req = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(currentReader.surface)
+                                // 独立帧率：视觉分析可跑低于图传的帧率，减轻 CPU 负担
+                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
+                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                            }.build()
+                            s.setRepeatingRequest(req, null, handler)
+                            Log.i(TAG, "视觉第二会话就绪 ${width}x${height}@${fps}")
+                        } catch (e: Exception) {
+                            stop()
+                            onError("视觉会话启动失败: ${e.message}")
+                        }
                     }
 
                     override fun onConfigureFailed(s: android.hardware.camera2.CameraCaptureSession) {
-                        running = false
+                        s.close()
+                        stop()
                         onError("视觉会话配置失败（设备可能不支持并发会话）")
                     }
                 },
                 handler
             )
         } catch (e: Exception) {
-            running = false
+            stop()
             onError("视觉会话创建失败: ${e.message}")
         }
     }
@@ -99,6 +110,7 @@ class VisionCamera(
         runCatching { session?.stopRepeating() }
         runCatching { session?.close() }
         session = null
+        runCatching { reader?.setOnImageAvailableListener(null, null) }
         runCatching { reader?.close() }
         reader = null
     }
@@ -107,7 +119,7 @@ class VisionCamera(
         private const val TAG = "VisionCamera"
 
         /**
-         * YUV_420_888 → RGB（BT.601 full range）。
+         * YUV_420_888 → RGB（BT.601 limited range，Camera2 常用范围）。
          *
          * 兼容各种 pixelStride/rowStride 布局（不同设备 YUV 平面排布不同）。
          * OpenCV 接入时也可直接用 YUV 平面构造 Mat，省去转换。

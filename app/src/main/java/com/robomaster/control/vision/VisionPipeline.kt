@@ -34,7 +34,9 @@ class VisionPipeline(private val settings: VisionSettings) {
         val navState: Navigation.State = Navigation.State.IDLE,
         val preprocessMs: Long = 0,
         val detectMs: Long = 0,
-        val totalMs: Long = 0
+        val totalMs: Long = 0,
+        /** false 表示本帧因节流复用旧结果，禁止再次执行开火等副作用。 */
+        val processed: Boolean = true
     )
 
     /** 追踪中的目标（卡尔曼滤波后） */
@@ -77,7 +79,7 @@ class VisionPipeline(private val settings: VisionSettings) {
         frameCounter++
         val everyN = settings.detectEveryNFrames
         if (frameCounter % everyN != 0) {
-            return lastResult ?: Result()
+            return (lastResult ?: Result()).copy(processed = false)
         }
 
         val t0 = System.nanoTime()
@@ -112,11 +114,12 @@ class VisionPipeline(private val settings: VisionSettings) {
             if (settings.deglareEnabled) {
                 processed = Deglare.process(processed, w, h)
             }
-            // 灰度回填 RGB（检测用颜色掩码，但预处理后的灰度也保留在 R 通道）
-            // 注：颜色检测仍用原 RGB；预处理结果用于调试显示与后续算法扩展
-            img = ByteArray(w * h * 3) { i ->
-                val v = processed[i / 3]
-                if (i % 3 == 0) v else 0
+            // 将亮度处理结果以增量方式回填 RGB，保留原有色差供 HSV 检测。
+            // 直接丢弃 processed 会让三个预处理开关只耗算力、不影响检测结果。
+            img = ByteArray(rgb.size) { i ->
+                val p = i / 3
+                val delta = (processed[p].toInt() and 0xFF) - (gray[p].toInt() and 0xFF)
+                ((rgb[i].toInt() and 0xFF) + delta).coerceIn(0, 255).toByte()
             }
         }
         val preprocessMs = (System.nanoTime() - tPre) / 1_000_000
@@ -126,10 +129,10 @@ class VisionPipeline(private val settings: VisionSettings) {
         val cam = TargetDetector.CameraParams(w, h)
         val targets = ArrayList<TargetDetector.Target>()
         if (settings.highlandTargetEnabled) {
-            targets.addAll(TargetDetector.detectHighland(rgb, w, h, cam, normalizeV = settings.vNormalizeEnabled))
+            targets.addAll(TargetDetector.detectHighland(img, w, h, cam, normalizeV = settings.vNormalizeEnabled))
         }
         if (settings.baseTargetEnabled) {
-            targets.addAll(TargetDetector.detectBase(rgb, w, h, cam, normalizeV = settings.vNormalizeEnabled))
+            targets.addAll(TargetDetector.detectBase(img, w, h, cam, normalizeV = settings.vNormalizeEnabled))
         }
         val detectMs = (System.nanoTime() - tDet) / 1_000_000
 
@@ -201,5 +204,7 @@ class VisionPipeline(private val settings: VisionSettings) {
         frameCounter = 0
         trackedAge = 0
         lastResult = null
+        highlandKf.reset()
+        baseKf.reset()
     }
 }

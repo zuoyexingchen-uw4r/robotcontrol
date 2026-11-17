@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 
 /**
  * WLAN 备用通道：TCP Socket 直连 ESP32-S3 的 AP/STA。
@@ -41,14 +42,25 @@ class WlanTransport(
             val buf = ByteArray(4096)
             try {
                 val ins = s.getInputStream()
-                while (state.value is ConnState.Connected) {
-                    val n = ins.read(buf)
-                    if (n > 0) incoming.emit(buf.copyOf(n))
-                    if (n < 0) break
+                while (socket === s && state.value is ConnState.Connected) {
+                    try {
+                        val n = ins.read(buf)
+                        if (n > 0) incoming.emit(buf.copyOf(n))
+                        if (n < 0) {
+                            state.value = ConnState.Error(name, "socket closed")
+                            break
+                        }
+                    } catch (_: SocketTimeoutException) {
+                        // soTimeout 只用于让读循环及时响应断开；空闲不等于掉线。
+                    } catch (e: Exception) {
+                        if (socket === s) {
+                            state.value = ConnState.Error(name, e.message ?: "wlan read error")
+                        }
+                        break
+                    }
                 }
-                state.value = ConnState.Error(name, "socket closed")
             } catch (e: Exception) {
-                state.value = ConnState.Error(name, e.message ?: "wlan read error")
+                if (socket === s) state.value = ConnState.Error(name, e.message ?: "wlan read error")
             }
         }
     }

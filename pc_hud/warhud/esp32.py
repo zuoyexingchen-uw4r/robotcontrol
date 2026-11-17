@@ -123,13 +123,19 @@ class Esp32Link:
 
     def _telem_loop(self) -> None:
         buf = b""
+        self.sock_tm.settimeout(0.5)
+        last_tick = time.monotonic()
         while self.running and self.sock_tm:
             try:
                 chunk = self.sock_tm.recv(256)
             except OSError:
                 break
+            # 遥测年龄随真实时间增长：断流 1 秒后 HUD 状态灯变红
+            now = time.monotonic()
+            self.telem_age_ms += (now - last_tick) * 1000
+            last_tick = now
             if not chunk:
-                break
+                continue
             self.telem_age_ms = 0.0
             buf += chunk
             while len(buf) >= protocol.TELEM_LEN:

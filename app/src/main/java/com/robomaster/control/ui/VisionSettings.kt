@@ -95,6 +95,42 @@ class VisionSettings private constructor(context: Context) {
         get() = sp.getBoolean("navigation", false)
         set(v) = sp.edit().putBoolean("navigation", v).apply()
 
+    /** HUD 设置快照；键名与 pc_hud/warhud/protocol.py 保持一致。 */
+    fun snapshot(): Map<String, Any> = mapOf(
+        "deblur" to deblurEnabled,
+        "smoothing" to smoothingEnabled,
+        "deglare" to deglareEnabled,
+        "highland" to highlandTargetEnabled,
+        "base" to baseTargetEnabled,
+        "tracking" to trackingEnabled,
+        "autofire" to autoFireEnabled,
+        "navigation" to navigationEnabled,
+        "guided_filter" to guidedFilterEnabled,
+        "v_normalize" to vNormalizeEnabled,
+        "detect_every_n" to detectEveryNFrames,
+    )
+
+    /** 应用 HUD 远程设置。只接受白名单键和正确类型，返回是否实际接受。 */
+    fun applyRemote(key: String, value: Any?): Boolean {
+        when (key) {
+            "deblur" -> if (value is Boolean) deblurEnabled = value else return false
+            "smoothing" -> if (value is Boolean) smoothingEnabled = value else return false
+            "deglare" -> if (value is Boolean) deglareEnabled = value else return false
+            "highland" -> if (value is Boolean) highlandTargetEnabled = value else return false
+            "base" -> if (value is Boolean) baseTargetEnabled = value else return false
+            "tracking" -> if (value is Boolean) trackingEnabled = value else return false
+            "autofire" -> if (value is Boolean) autoFireEnabled = value else return false
+            "navigation" -> if (value is Boolean) navigationEnabled = value else return false
+            "guided_filter" -> if (value is Boolean) guidedFilterEnabled = value else return false
+            "v_normalize" -> if (value is Boolean) vNormalizeEnabled = value else return false
+            "detect_every_n" -> if (value is Number) {
+                detectEveryNFrames = value.toInt()
+            } else return false
+            else -> return false
+        }
+        return true
+    }
+
     companion object {
         @Volatile private var inst: VisionSettings? = null
 

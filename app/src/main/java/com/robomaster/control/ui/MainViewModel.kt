@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * 第一屏（HMI）状态与通信。
@@ -106,7 +107,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         pingJob?.cancel()
-        viewModelScope.launch { manager.stop() }
+        // onCleared 时 viewModelScope 已开始取消，不能再依赖它执行清理。
+        runBlocking { manager.stop() }
         super.onCleared()
     }
 }
