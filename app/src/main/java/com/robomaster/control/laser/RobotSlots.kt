@@ -1,11 +1,10 @@
 package com.robomaster.control.laser
 
 /**
- * 机器人槽位配置表（与 scripts/switch_ip.sh 保持一致）。
+ * 机器人槽位配置表（与 scripts/switch_ip.sh、LASER_PROTOCOL.md 保持一致）。
  *
  * 槽位 → 机器人 IP，用于赛前在安卓设备上切换本机 IP。
- * 注意：B1 蓝方射击机器人 robot_id 原需求表写 `blue_r1`（疑为笔误），
- * 已按语义修正为 `blue_b1`；如需保留请改回。
+ * robot_id 里 `r` 是 robot 的简写：蓝方射击/兑矿为 `blue_r1` / `blue_r2`。
  */
 object RobotSlots {
 
@@ -19,8 +18,8 @@ object RobotSlots {
     val SLOTS: List<Slot> = listOf(
         Slot("R1", "红方射击", "red_r1", "192.168.1.3"),
         Slot("R2", "红方兑矿", "red_r2", "192.168.1.4"),
-        Slot("B1", "蓝方射击", "blue_b1", "192.168.1.5"),
-        Slot("B2", "蓝方兑矿", "blue_b2", "192.168.1.6"),
+        Slot("B1", "蓝方射击", "blue_r1", "192.168.1.5"),
+        Slot("B2", "蓝方兑矿", "blue_r2", "192.168.1.6"),
     )
 
     fun byIp(ip: String): Slot? = SLOTS.firstOrNull { it.ip == ip }

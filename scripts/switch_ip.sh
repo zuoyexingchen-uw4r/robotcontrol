@@ -6,8 +6,8 @@
 #   槽位  机器人        robot_id   IP
 #   R1    红方射击      red_r1     192.168.1.3
 #   R2    红方兑矿      red_r2     192.168.1.4
-#   B1    蓝方射击      blue_b1     192.168.1.5   （原表写 blue_r1，已按语义修正）
-#   B2    蓝方兑矿      blue_b2     192.168.1.6
+#   B1    蓝方射击      blue_r1    192.168.1.5
+#   B2    蓝方兑矿      blue_r2    192.168.1.6
 #
 # 两种用法：
 #   1) 直接改： bash switch_ip.sh red_r1
@@ -28,8 +28,8 @@ LISTEN_PORT=8769
 declare -A SLOTS=(
     [red_r1]="192.168.1.3"
     [red_r2]="192.168.1.4"
-    [blue_b1]="192.168.1.5"
-    [blue_b2]="192.168.1.6"
+    [blue_r1]="192.168.1.5"
+    [blue_r2]="192.168.1.6"
 )
 
 log() { echo -e "\033[1;32m[switch-ip]\033[0m $*"; }
@@ -110,6 +110,6 @@ print(d.decode('utf-8','ignore').strip())
 
 case "${1:-}" in
     --listen) listen_mode "${2:-$LISTEN_PORT}" ;;
-    "") echo "用法: $0 <red_r1|red_r2|blue_b1|blue_b2> | --listen [port]" >&2; exit 1 ;;
+    "") echo "用法: $0 <red_r1|red_r2|blue_r1|blue_r2> | --listen [port]" >&2; exit 1 ;;
     *) do_switch "$1" ;;
 esac
