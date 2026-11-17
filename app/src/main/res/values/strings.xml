@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">狼牙视觉</string>
+    <string name="accessibility_service_label">狼牙自动恢复服务</string>
+    <string name="accessibility_service_desc">在极端工况（USB 授权弹窗、应用停止、被系统回收）下自动恢复视觉与激光链路。仅用于局域网比赛设备。</string>
 </resources>

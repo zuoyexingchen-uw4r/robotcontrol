@@ -16,6 +16,13 @@
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
 
+    <!-- 激光桥前台服务 + 自动恢复（仅局域网设备，放开权限） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- 本 App 依赖 USB Host（OTG）连接 ESP32-S3 -->
     <uses-feature
         android:name="android.hardware.usb.host"
@@ -55,5 +62,25 @@
             android:name=".ui.VisionSettingsActivity"
             android:exported="false"
             android:screenOrientation="landscape" />
+
+        <!-- 激光雷达 + 主控混合桥前台服务（保活 + USB 自动重连） -->
+        <service
+            android:name=".laser.LaserBridgeService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- 自动恢复无障碍服务（极端工况兜底） -->
+        <service
+            android:name=".ui.AutoRecoverAccessibilityService"
+            android:exported="false"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
     </application>
 </manifest>

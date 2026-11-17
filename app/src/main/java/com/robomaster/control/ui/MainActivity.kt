@@ -124,6 +124,11 @@ class MainActivity : AppCompatActivity() {
             startActivity(android.content.Intent(this, VisionSettingsActivity::class.java))
         }
 
+        // 激光桥：启动/停止激光+主控混合桥前台服务（USB 自动重连 + TCP/UDP）
+        binding.btnLaser.setOnClickListener {
+            toggleLaserBridge()
+        }
+
         // 图传一键启停（用第二屏记忆的配置）
         binding.btnVideo.setOnClickListener { toggleVideo() }
 
@@ -288,6 +293,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun log(msg: String) {
         vm.logs.value = (vm.logs.value + msg).takeLast(200)
+    }
+
+    private var laserRunning = false
+
+    /** 启动/停止激光桥前台服务 */
+    private fun toggleLaserBridge() {
+        val s = Settings.get(this)
+        if (!laserRunning) {
+            if (s.host.isBlank()) {
+                toast("请先到第二屏配置电脑 IP")
+                return
+            }
+            com.robomaster.control.laser.LaserBridgeService.start(
+                this, s.host, s.laserBaud, s.laserMode
+            )
+            laserRunning = true
+            binding.btnLaser.text = "停止激光桥"
+            log("[激光] 启动混合桥 → ${s.host} (baud=${s.laserBaud} mode=${s.laserMode})")
+        } else {
+            stopService(android.content.Intent(this, com.robomaster.control.laser.LaserBridgeService::class.java))
+            laserRunning = false
+            binding.btnLaser.text = "激光桥"
+            log("[激光] 已停止")
+        }
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()

@@ -86,6 +86,16 @@ class Settings private constructor(context: Context) {
         get() = sp.getBoolean("adaptive_kf", false)
         set(v) = sp.edit().putBoolean("adaptive_kf", v).apply()
 
+    /** 激光桥波特率（雷达 230400，CH343 ≥ 此值） */
+    var laserBaud: Int
+        get() = sp.getInt("laser_baud", 230400)
+        set(v) = sp.edit().putInt("laser_baud", v).apply()
+
+    /** 激光桥传输模式：0=AUTO 1=TCP 2=UDP */
+    var laserMode: Int
+        get() = sp.getInt("laser_mode", 0)
+        set(v) = sp.edit().putInt("laser_mode", v.coerceIn(0, 2)).apply()
+
     companion object {
         @Volatile private var inst: Settings? = null
 
