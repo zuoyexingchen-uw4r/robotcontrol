@@ -30,6 +30,7 @@ ESP32/S3 主控 ──UART── CH343 ──USB-OTG── 小米手机(视觉�
 |---|---|---|
 | `host/laser_host.py` | 激光雷达 + 主控混合流上位机（TCP+UDP+FEC） | ✅ 可跑，自测 10/10 |
 | `host/video_host.py` | 图传视频接收（GameStream/RS-FEC 解码） | ✅ 已有 |
+| `host/spaa/` | **图传上位机**（GL 纹理显示 + 叠加层，SPAA 信息布局） | ✅ 新增，自测 28/28 |
 | `host/rs_selftest.py` | RS-FEC 自测 | ✅ 22/22 |
 | `host/serial_host.py` | 串口透传测试 | ✅ 已有 |
 | `pc_hud/` | 笔记本操控 HUD（PyQt5） | ✅ 已有 |
@@ -103,6 +104,10 @@ python laser_host.py --print-lidar --print-master   # 打印雷达摘要 + 主�
 python host/laser_host.py --selftest        # 期望 10/10
 # 图传 RS-FEC
 python host/rs_selftest.py                   # 期望 22/22
+# 图传上位机（协议/投影/组帧，不需要窗口）
+python host/spaa_host.py --selftest          # 期望 28/28
+# 图传上位机端到端（ffmpeg 造流 → 本机收 → 解码 → 截图，不需手机）
+python host/spaa/e2e_test.py
 # HUD 冒烟（需 PyQt5/pygame）
 QT_QPA_PLATFORM=offscreen python pc_hud/smoke_test.py   # 期望 20/20
 # HUD 协议 + 手柄
