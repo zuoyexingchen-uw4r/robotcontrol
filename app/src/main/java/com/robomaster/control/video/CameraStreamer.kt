@@ -49,7 +49,8 @@ class CameraStreamer(
         val fecPercentage: Int = 30,
         val hostIp: String,
         val videoPort: Int,
-        val controlPort: Int,
+        /** 已废弃：图传控制走 UDP，直接回到视频 socket 的源地址，不再单独连端口 */
+        @Deprecated("图传控制已改为 UDP 回发视频源地址") val controlPort: Int = 0,
         val previewSurface: Surface? = null,
         /**
          * 相机就绪回调：CameraDevice 打开后触发（图传 session 建立之前）。
@@ -72,15 +73,14 @@ class CameraStreamer(
         val adaptiveKeyframe: Boolean = false,
         /**
          * 参数集重复策略（每个 IDR 是否都重新拼 VPS/SPS/PPS 或 SPS/PPS）：
-         *  0 = 自动（默认）：HEVC 每个 IDR 都拼，H.264 保持原行为
-         *  1 = 始终重复：H.264 也每个 IDR 拼（H.264 遇到参数集丢失时用）
-         *  2 = 从不重复：完全保持旧行为
+         *  0 = 自动（默认）：两者都每个 IDR 重拼
+         *  1 = 始终重复（等价自动，保留给旧界面）
+         *  2 = 从不重复：只有第一个 IDR 带参数集
          *
-         * 为什么 HEVC 要修：HEVC 参数集只在编码器启动时输出一次，旧代码拼完第一个
-         * 关键帧就清空缓存。一旦那个 IDR 有任何分片丢失，参数集永久消失，后续每个
-         * P 帧都解不出——表现为一卡一卡 + 解码器刷
-         * "First slice in a frame missing" / "Could not find ref with POC xx"。
-         * H.264 参数集行为不同（实测可自愈），默认不动，选择权留给用户。
+         * 为什么默认要重复：参数集只在编码器启动时输出一次，旧代码拼完第一个关键帧
+         * 就清空缓存。一旦那个 IDR 丢包，或**上位机是中途启动的**，后面的 IDR 不带
+         * 参数集，接收端就永远解不出来——表现为控制通道正常、画面一直黑。
+         * 每个 IDR 重拼只多几十字节，换“随时可接入”。
          */
         val repeatCsd: Int = 0,
     )
@@ -241,7 +241,11 @@ class CameraStreamer(
         repeatCsdPerIdr = when (cfg.repeatCsd) {
             1 -> true                       // 始终重复（修复的 264 / 265）
             2 -> false                      // 从不重复（未修复）
-            else -> cfg.codecMime == "video/hevc"   // 自动：HEVC 修、H.264 不动
+            // 自动：两者都重复。
+            // H.264 以前只在首个 IDR 前拼一次 SPS/PPS，之后清空——上位机若是**中途启动**，
+            // 后面的 IDR 不带参数集，ffmpeg 永远解不出来（表现为一直黑屏，但控制通道
+            // SS_RFI_REQUEST 是通的）。每个 IDR 重拼只多几十字节，换“随时可接入”。
+            else -> true
         }
         try {
             val pick = EncoderPicker.pick(cfg.codecMime, cfg.encoderMode)
@@ -253,8 +257,12 @@ class CameraStreamer(
                     onLog = this@CameraStreamer.onLog
                     onIdle = { idleMs -> maybeBoostKeyframe(cfg, idleMs) }
                     onDrop = { maybeKeyframeAfterDrop() }
+                    // 图传控制走同一条 UDP：上位机把 03 01 发回视频源地址
+                    onKeyframeRequest = {
+                        requestKeyframe()
+                        onLog("[图传] 收到 UDP 关键帧请求，触发 IDR")
+                    }
                 }
-            startControlClient(cfg)
 
             encoder = try {
                 createEncoder(pick.name, buildFormat(cfg, pick, withProfile = true))
@@ -392,11 +400,29 @@ class CameraStreamer(
 
         val sessionCb = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
+                // 停止/重开竞态：session 回调可能晚于 stop()（device 已 close），
+                // 这时再 createCaptureRequest 会抛 IllegalStateException 直接崩进程。
+                if (!running) {
+                    runCatching { s.close() }
+                    return
+                }
                 session = s
-                val base = cd.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                    targets.forEach { addTarget(it) }
-                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(cfg.fps, cfg.fps))
-                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                // 纯编码管线：session 里**只有编码器 Surface**，不再塞 preview target。
+                // 之前为了本地预览往同一个 session 加预览 Surface，实测会让推流画面
+                // 方向变歪（HAL 在双 target 下选了另一条输出路径）；本地预览已改走
+                // 视觉会话的 YUV 帧，这里保持单一 target 即可。
+                val template = CameraDevice.TEMPLATE_RECORD
+                val base = try {
+                    cd.createCaptureRequest(template).apply {
+                        targets.forEach { addTarget(it) }
+                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(cfg.fps, cfg.fps))
+                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                    }
+                } catch (e: IllegalStateException) {
+                    // stop() 已经 close 了 device，这个迟到的回调直接丢掉
+                    onLog("[图传] 会话配置竞态：相机已关闭，忽略本次配置")
+                    runCatching { s.close() }
+                    return
                 }
                 // 厂商私有 fps tag（仅 >30fps 请求时尝试，尽力而为）：
                 // 合作者在荣耀 SM6450 上逆向出 com.hihonor.capture.metadata.hw-video-fps=60，
@@ -441,8 +467,14 @@ class CameraStreamer(
                         onLog("[图传] 设备不支援会话内改 ISP 模式，用模板默认")
                     }
                 } catch (e: CameraAccessException) {
-                    s.setRepeatingRequest(base.build(), depthCb, handler)
+                    runCatching { s.setRepeatingRequest(base.build(), depthCb, handler) }
+                        .onFailure { onLog("[图传] 请求提交失败：${it.message}") }
                     onLog("[图传] 低延迟 ISP 被拒（${e.message}），已回退默认设置")
+                } catch (e: IllegalStateException) {
+                    // 同一 CameraDevice 上另一条 session 建立时，HAL 可能把这条先关掉
+                    // （本机不支持双 session 并发时的表现）。直接放弃，不崩进程。
+                    onLog("[图传] 会话被关闭（${e.message}），本次请求放弃")
+                    return
                 }
                 onLog("[图传] 推流中 → ${cfg.hostIp}:${cfg.videoPort}")
             }
@@ -460,6 +492,10 @@ class CameraStreamer(
                             onLog = this@CameraStreamer.onLog
                             onIdle = { idleMs -> maybeBoostKeyframe(fb, idleMs) }
                             onDrop = { maybeKeyframeAfterDrop() }
+                            onKeyframeRequest = {
+                                requestKeyframe()
+                                onLog("[图传] 收到 UDP 关键帧请求，触发 IDR")
+                            }
                         }
                     onLog("[图传] ${cfg.fps}fps 会话被 HAL 拒绝，已自动回退 30fps（编码器不变）")
                     buildSession(cd, fb)
@@ -624,37 +660,11 @@ class CameraStreamer(
     }
 
     /**
-     * TCP 控制通道（GameStream 风格）：电脑发 4 字节大端消息类型。
-     * 0x0301 = SS_RFI_REQUEST → 让编码器立刻出 IDR 关键帧。
-     *
-     * **方向（2026-10 改）**：电脑开端口监听，手机主动 connect（见 [TcpChannel]）。
-     * 旧实现是手机开 ServerSocket 等电脑连，与串口透传方向相反；现在三条通道
-     * （视频 UDP / 控制 TCP / 串口 TCP）统一为「电脑监听、手机连接」。
+     * 图传控制（关键帧请求）已改为 **UDP 回发视频源地址**：
+     * 上位机收到视频包后，把 4 字节大端 `0x0301` 发回该包的源地址/端口，
+     * [GameStreamSender] 在自己的 socket 上收。手机仍然不监听任何端口，
+     * 也不再需要一条独立的 TCP 控制连接。
      */
-    private fun startControlClient(cfg: Config) {
-        val ch = TcpChannel(scope, cfg.hostIp, cfg.controlPort, label = "控制通道").apply {
-            onLog = this@CameraStreamer.onLog
-            onData = { bytes ->
-                // TCP 是字节流：多个消息可能粘在一个段里，按 4 字节边界切
-                var off = 0
-                while (bytes.size - off >= 4) {
-                    val type = java.nio.ByteBuffer.wrap(bytes, off, 4).int
-                    off += 4
-                    when (type) {
-                        0x0301 -> {
-                            requestKeyframe()
-                            onLog("[图传] 收到 SS_RFI_REQUEST，触发 IDR")
-                        }
-                        else -> onLog("[图传] 控制消息 0x${type.toString(16)}")
-                    }
-                }
-            }
-        }
-        controlChannel = ch
-        ch.start()
-        onLog("[图传] 控制通道 → ${cfg.hostIp}:${cfg.controlPort}（电脑监听中，连接后可请求关键帧）")
-    }
-
     fun requestKeyframe() {
         try {
             val b = Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }

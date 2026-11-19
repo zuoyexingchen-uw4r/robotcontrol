@@ -4,13 +4,14 @@
 
 用法：
     python host/spaa_host.py              # 启动界面
-    python host/spaa_host.py --selftest   # 纯逻辑自测（不开窗口）
+    python host/spaa_host.py --selftest   # 纯逻辑自测（SPAA + netstack）
     python host/spaa_host.py --check      # 只检查依赖
 
 快捷键：
     F11 全屏 / Esc 退出        R 录制裸流
     P 截图（含 HUD）           K 请求关键帧
     O 测距环开关               Q 退出
+    0 配对二维码              F2 设置（IP / 端口 / 槽位）
 """
 from __future__ import annotations
 
@@ -41,11 +42,30 @@ def check_deps() -> bool:
     ff = cfg["ffmpeg_path"]
     if shutil.which(ff) or os.path.exists(ff):
         print(f"[ok] ffmpeg: {ff}")
+        probe = cfg.get("ffprobe_path") or ""
+        if not probe:
+            base = os.path.dirname(ff)
+            for name in ("ffprobe.exe", "ffprobe"):
+                cand = os.path.join(base, name) if base else ""
+                if cand and os.path.isfile(cand):
+                    probe = cand
+                    break
+            probe = probe or (shutil.which("ffprobe") or "ffprobe")
+        if shutil.which(probe) or os.path.exists(probe):
+            print(f"[ok] ffprobe: {probe}（解码前探测分辨率/编码）")
+        else:
+            print(f"[--] ffprobe 找不到（{probe}）：会退化成按配置解码，H.264/HEVC 选错就没画面")
     else:
         print(f"[--] ffmpeg 找不到（{ff}），装一个或改 ~/.spaa/config.json")
         ok = False
-    print(f"     视频端口 {cfg['video_port']}/控制 {cfg['ctrl_port']}，"
-          f"雷达 {cfg['laser_udp']}，视觉 {cfg['vision_port']}")
+    try:
+        import qrcode  # noqa: F401
+        print("[ok] qrcode（按 0 出二维码）")
+    except ImportError:
+        print("[--] qrcode 未安装：pip install qrcode（没有也能跑，只是二维码显示文本）")
+    print(f"     图传 {cfg['video_port']}/控制 {cfg['ctrl_port']}，"
+          f"非图传 UDP {cfg['net_udp']} / TCP {cfg['net_tcp']}，"
+          f"IP 模式 {cfg['ip_mode']}")
     return ok
 
 
@@ -57,8 +77,9 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.selftest:
-        from spaa.selftest import run
-        return run()
+        from spaa.selftest import run as run_spaa
+        from netstack.selftest import run as run_net
+        return max(run_spaa(), run_net())
 
     if args.check:
         return 0 if check_deps() else 1

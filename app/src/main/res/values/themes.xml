@@ -1,8 +1,17 @@
-<resources>
-    <!-- 硬核深色控制台风格 -->
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 硬核深色控制台风格：保留给二级页（桥接控制台 / 视觉设置，仍是 XML 视图） -->
     <style name="Theme.RobotControl" parent="Theme.Material3.Dark.NoActionBar">
         <item name="android:statusBarColor">#FF101418</item>
         <item name="android:navigationBarColor">#FF101418</item>
         <item name="android:windowBackground">#FF101418</item>
+    </style>
+
+    <!-- 主控制台：浅色 M3 Expressive（Compose 侧再套 MaterialExpressiveTheme） -->
+    <style name="Theme.Langya.Light" parent="Theme.Material3.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">#FFFEF7FF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="27">shortEdges</item>
     </style>
 </resources>

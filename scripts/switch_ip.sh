@@ -10,10 +10,12 @@
 #   B2    蓝方兑矿      blue_r2    192.168.1.6
 #
 # 两种用法：
-#   1) 直接改： bash switch_ip.sh red_r1
+#   1) 直接改： bash switch_ip.sh red_r1        # 钉静态 IP
+#              bash switch_ip.sh dhcp           # 恢复默认 DHCP
 #   2) 监听模式： bash switch_ip.sh --listen [port]
 #      监听 UDP，收到安卓 App 发来的 "switch_ip <robot_id>" 后改 IP。
 #      App 按钮 → UDP 广播 "switch_ip red_r1" → 本脚本 → adb shell ip addr ...
+#      App 的「恢复DHCP」→ 广播 "switch_ip dhcp" → 本脚本摘掉静态地址、重新 DHCP
 #
 # 前置：手机已开 USB 调试并授权本机（adb devices 可见）。
 # 改 IP 需要 root：脚本会依次尝试 `adb root` / `adb shell su -c`。
@@ -71,10 +73,46 @@ do_switch() {
     local id="$1"
     local ip="${SLOTS[$id]:-}"
     if [ -z "$ip" ]; then
-        echo "未知 robot_id: $id（可选：${!SLOTS[*]}）" >&2
+        echo "未知 robot_id: $id（可选：${!SLOTS[*]} 或 dhcp）" >&2
         exit 1
     fi
     set_ip "$ip"
+    reconnect
+}
+
+# ── 恢复默认 DHCP ──
+# App 里点「恢复DHCP」→ 广播 "switch_ip dhcp" → 这里把静态地址摘掉，交还路由器分配。
+# Android 10+ 没有直接开 DHCP 客户端的公开命令，按成功率依次尝试：
+#   1) dhcptool（Android 6~9 常见）；
+#   2) 关/开 WiFi（触发系统重新 DHCP，最通用的软办法）；
+#   3) 仍有静态地址时再 flush 一次，避免"两个地址同时存在"。
+set_dhcp() {
+    log "恢复默认 DHCP（$NETIF）…"
+    shell_cmd "ip addr flush dev $NETIF scope global" || true
+    shell_cmd "ip link set $NETIF up" || true
+
+    if shell_cmd "command -v dhcptool" 2>/dev/null | grep -q dhcptool; then
+        log "尝试 dhcptool $NETIF dhcp"
+        shell_cmd "dhcptool $NETIF dhcp" || true
+    else
+        log "无 dhcptool，改用 WiFi 重连触发 DHCP"
+        adb shell svc wifi disable 2>/dev/null || true
+        sleep 2
+        adb shell svc wifi enable 2>/dev/null || true
+        sleep 4
+    fi
+
+    local addr
+    addr=$(adb shell "ip -4 addr show dev $NETIF 2>/dev/null | grep -o 'inet [0-9.]*'" 2>/dev/null | head -1)
+    if [ -n "$addr" ]; then
+        log "当前地址：$addr（DHCP 已生效）"
+    else
+        log "尚未拿到地址：可在手机 Wi-Fi 设置里点一下网络，或再执行一次本命令"
+    fi
+}
+
+do_dhcp() {
+    set_dhcp
     reconnect
 }
 
@@ -100,8 +138,13 @@ print(d.decode('utf-8','ignore').strip())
         case "$msg" in
             switch_ip\ *) 
                 local id="${msg#switch_ip }"
-                log "收到指令：切换到 $id"
-                do_switch "$id"
+                if [ "$id" = "dhcp" ]; then
+                    log "收到指令：恢复默认 DHCP"
+                    do_dhcp
+                else
+                    log "收到指令：切换到 $id"
+                    do_switch "$id"
+                fi
                 ;;
             "") sleep 1 ;;
         esac
@@ -110,6 +153,7 @@ print(d.decode('utf-8','ignore').strip())
 
 case "${1:-}" in
     --listen) listen_mode "${2:-$LISTEN_PORT}" ;;
-    "") echo "用法: $0 <red_r1|red_r2|blue_r1|blue_r2> | --listen [port]" >&2; exit 1 ;;
+    "") echo "用法: $0 <red_r1|red_r2|blue_r1|blue_r2|dhcp> | --listen [port]" >&2; exit 1 ;;
+    dhcp) do_dhcp ;;
     *) do_switch "$1" ;;
 esac

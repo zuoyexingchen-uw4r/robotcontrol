@@ -46,6 +46,12 @@ class UsbSerialTransport(
     /** 强制接管时指定 UsbDevice.deviceName（如 /dev/bus/usb/001/004），为空取首个设备 */
     @Volatile var forcedDeviceName: String? = null
 
+    /** 目标设备 VID（0 = 不过滤）。默认 WCH 0x1A86，界面「串口VID」可改 */
+    @Volatile var vidFilter: Int = 0x1A86
+
+    /** 目标设备 PID（0 = 不过滤）。默认 0x55D3（CH343 CDC-ACM），界面「串口PID」可改 */
+    @Volatile var pidFilter: Int = 0x55D3
+
     override val name = "USB-OTG"
     override val state = MutableStateFlow<ConnState>(ConnState.Idle)
     override val incoming = MutableSharedFlow<ByteArray>(extraBufferCapacity = 512)
@@ -71,8 +77,18 @@ class UsbSerialTransport(
         table.addProduct(wchVid, 0x55D4, CdcAcmSerialDriver::class.java) // CH343 CDC-ACM
         table.addProduct(wchVid, 0x7522, Ch34xSerialDriver::class.java)  // CH340 厂商模式
         table.addProduct(wchVid, 0x7523, Ch34xSerialDriver::class.java)  // CH340 厂商模式
+        // 界面里手填的 VID/PID 也登记一遍，未在默认表里的自定义 CDC 设备可直接识别
+        val v = vidFilter
+        val p = pidFilter
+        if (v > 0 && p > 0) {
+            table.addProduct(v, p, CdcAcmSerialDriver::class.java)
+        }
         return UsbSerialProber(table)
     }
+
+    /** 按当前 VID/PID（0 = 通配）匹配设备 */
+    private fun matchDevice(d: UsbDevice): Boolean =
+        (vidFilter == 0 || d.vendorId == vidFilter) && (pidFilter == 0 || d.productId == pidFilter)
 
     /** 拿到设备并申请 OTG 权限（会阻塞等待用户授权） */
     private suspend fun acquirePort(): UsbSerialPort = withContext(Dispatchers.Main) {
@@ -81,8 +97,10 @@ class UsbSerialTransport(
                 ?: usbManager.deviceList.values.firstOrNull())
                 ?: throw IllegalStateException("未发现可接管的 USB 设备")
         } else {
-            usbManager.deviceList.values.firstOrNull { it.vendorId == wchVid }
-                ?: throw IllegalStateException("未发现 WCH(0x1A86) USB 设备（确认 OTG 线连接）")
+            usbManager.deviceList.values.firstOrNull { matchDevice(it) }
+                ?: throw IllegalStateException(
+                    "未发现 VID=0x%04X PID=0x%04X 的 USB 设备（确认 OTG 线连接）".format(vidFilter, pidFilter)
+                )
         }
         val driver: UsbSerialDriver = if (ignoreDeviceId) {
             CdcAcmSerialDriver(device) // 强制接管：通用 CDC 驱动打开，绕过 VID/PID 匹配

@@ -77,6 +77,8 @@ class VideoReceiver:
         self._last_ts = None
         self._last_fi_for_ts = None
         self._first_pkt = False
+        self._t_start = time.time()
+        self._wait_logged = False
 
         # 录制（存原始 Annex-B，比转 RGB 小一个数量级）
         self._rec_fp = None
@@ -127,6 +129,11 @@ class VideoReceiver:
                 try:
                     pkt, _addr = s.recvfrom(65535)
                 except socket.timeout:
+                    if (not self._first_pkt and not self._wait_logged
+                            and time.time() - self._t_start > 3.0):
+                        self._wait_logged = True
+                        print(f"[video] 还没收到视频包：确认手机图传端口 = {self.cfg['video_port']}，"
+                              f"且推流已启动（手机日志应有「推流中」）", file=sys.stderr)
                     self._flush_stats()
                     continue
                 except OSError as e:

@@ -93,10 +93,46 @@ class GameStreamSender(
      */
     var onDrop: (() -> Unit)? = null
 
+    /**
+     * 收到上位机的 UDP 关键帧请求（`00 00 03 01`，`SS_RFI_REQUEST`）。
+     * 上位机把请求发回**本 socket 的源地址**，手机不需要监听任何端口。
+     */
+    var onKeyframeRequest: (() -> Unit)? = null
+
     private val worker = Thread({ runLoop() }, "gs-sender").apply { start() }
+    private val rxWorker = Thread({ runRxLoop() }, "gs-rx").apply {
+        isDaemon = true
+        start()
+    }
 
     init {
         runCatching { socket.sendBufferSize = 1 shl 20 }
+        runCatching { socket.soTimeout = 500 }   // 让接收循环能感知 stopped
+    }
+
+    /**
+     * 收控制包：视频 socket 同时收上行回复，避免再开一条 TCP 控制通道。
+     * 只认 4 字节大端 0x0301，其余一律忽略（比如自己发出去的回环）。
+     */
+    private fun runRxLoop() {
+        val buf = ByteArray(64)
+        while (!stopped) {
+            val pkt = DatagramPacket(buf, buf.size)
+            try {
+                socket.receive(pkt)
+                if (pkt.length >= 4) {
+                    val type = ((buf[0].toInt() and 0xFF) shl 24) or
+                        ((buf[1].toInt() and 0xFF) shl 16) or
+                        ((buf[2].toInt() and 0xFF) shl 8) or
+                        (buf[3].toInt() and 0xFF)
+                    if (type == 0x0301) onKeyframeRequest?.invoke()
+                }
+            } catch (_: java.net.SocketTimeoutException) {
+                // 正常：只为周期性检查 stopped
+            } catch (_: Exception) {
+                if (stopped) break
+            }
+        }
     }
 
     /**
@@ -275,6 +311,7 @@ class GameStreamSender(
     fun close() {
         stopped = true
         runCatching { worker.interrupt() }
+        runCatching { rxWorker.interrupt() }
         runCatching { worker.join(500) }
         runCatching { socket.close() }
     }

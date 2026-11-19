@@ -4,6 +4,8 @@
     ffmpeg 解码 → rgb24 内存帧 → glTexSubImage2D 上传 → 全屏 quad 绘制
     → QPainter 在同一块 GL 画布上画 HUD
 ffplay 做不到这一点：它独占窗口，叠加层没法跟画面严格对齐。
+
+快捷键补充：0 = 配对二维码，F2 = 设置（IP / 端口 / 槽位）。
 """
 from __future__ import annotations
 
@@ -14,15 +16,19 @@ import time
 from OpenGL import GL as gl
 from PyQt5.QtCore import QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPainter
-from PyQt5.QtWidgets import QMainWindow, QOpenGLWidget
+from PyQt5.QtWidgets import QDialog, QMainWindow, QOpenGLWidget
+
+from netstack import ipcfg, pairing
 
 from . import config as cfgmod
 from .decoder import VideoDecoder
 from .game_state import GameState, MockSource
 from .geometry import CameraModel
 from .hud import SpaaHud
+from .qr_dialog import QrDialog
 from .rx_aux import AuxLink
 from .rx_video import VideoReceiver
+from .settings_dialog import SettingsDialog
 
 
 class SpaaView(QOpenGLWidget):
@@ -58,10 +64,10 @@ class SpaaView(QOpenGLWidget):
         self._seq = seq
 
     def video_rect(self) -> QRectF:
-        """保持视频宽高比的居中矩形（letterbox）。"""
+        """保持视频宽高比的居中矩形（letterbox）。宽高取解码器探测到的真实尺寸。"""
         W, H = self.width(), self.height()
-        dw = float(self.win.cfg["decode_w"])
-        dh = float(self.win.cfg["decode_h"])
+        dw, dh = self.win.dec.size()
+        dw, dh = float(dw), float(dh)
         if W <= 0 or H <= 0 or dw <= 0 or dh <= 0:
             return QRectF(0, 0, W, H)
         ar = dw / dh
@@ -82,8 +88,11 @@ class SpaaView(QOpenGLWidget):
 
         frame = self._frame
         if frame:
-            w = int(self.win.cfg["decode_w"])
-            h = int(self.win.cfg["decode_h"])
+            w, h = self.win.dec.size()
+            if w <= 0 or h <= 0 or len(frame) != w * h * 3:
+                # 解码器刚换分辨率/重启，这一帧长度对不上：跳过，别上传错纹理
+                frame = None
+        if frame:
             # 每帧都要显式开启：上一帧收尾时为了不让 Qt 的字形纹理错绑，关掉了它
             gl.glEnable(gl.GL_TEXTURE_2D)
             gl.glBindTexture(gl.GL_TEXTURE_2D, self._tex)
@@ -143,8 +152,9 @@ class MainWindow(QMainWindow):
         self.rx = VideoReceiver(self.cfg, self.rx_q)
         self.dec = VideoDecoder(self.cfg, self.rx_q)
         self.aux = AuxLink(self.cfg)
-        self.cam = CameraModel(self.cfg, int(self.cfg["decode_w"]),
-                               int(self.cfg["decode_h"]))
+        # 分辨率由解码器从码流里探测，先按兜底值建模型；探测出真值后 _tick 里重建
+        self._frame_size = self.dec.size()
+        self.cam = CameraModel(self.cfg, self._frame_size[0], self._frame_size[1])
         self.hud = SpaaHud(self.cfg, self.cam)
 
         self.view = SpaaView(self)
@@ -186,6 +196,15 @@ class MainWindow(QMainWindow):
             self._last_frame_t = time.time()
 
         frame_ready = bool(frame) and (time.time() - self._last_frame_t < 1.5)
+
+        # 码流探测到真实分辨率后，重建相机模型与 HUD（测距环、准星都按它算）
+        sz = self.dec.size()
+        if sz != self._frame_size:
+            self._frame_size = sz
+            self.cfg["decode_w"], self.cfg["decode_h"] = sz
+            self.cam = CameraModel(self.cfg, sz[0], sz[1])
+            self.hud = SpaaHud(self.cfg, self.cam)
+
         aux = self.aux.snapshot()
         master = aux.get("master")
 
@@ -259,6 +278,14 @@ class MainWindow(QMainWindow):
             self._hold["power_off"] = time.time()
             return
 
+        # 0 = 配对二维码，F2 = 设置（IP/端口/槽位）
+        if k == Qt.Key_0:
+            self._show_pairing()
+            return
+        if k == Qt.Key_F2:
+            self._open_settings()
+            return
+
         if k == Qt.Key_F11:
             self._toggle_fullscreen()
         elif k == Qt.Key_Escape and self._fullscreen:
@@ -317,6 +344,36 @@ class MainWindow(QMainWindow):
     def _toast(self, text: str, detail: str = "", tone: str = "info") -> None:
         self.toasts.append((text, detail, tone, time.time()))
         self.toasts = self.toasts[-8:]
+
+    # ─────────── 配网 / 配对 ───────────
+
+    def _pairing_ip(self) -> str:
+        """二维码里写哪个 IP：优先用已选网卡的实际地址，其次模式目标地址，最后出口地址。"""
+        name = str(self.cfg.get("adapter", "") or "")
+        ip = ipcfg.adapter_ip(name) if name else ""
+        if not ip:
+            ip = ipcfg.MODES.get(str(self.cfg.get("ip_mode", "RR1")), {}).get("ip") or ""
+        return ip or ipcfg.local_ip_hint()
+
+    def _show_pairing(self) -> None:
+        p = pairing.payload(self.cfg, self._pairing_ip())
+        self._toast("配对二维码", f"{p['ip']}:{p['port']} · {p['slot']}", "info")
+        QrDialog(p, self).exec_()
+
+    def _open_settings(self) -> None:
+        old_net = (self.cfg.get("net_udp"), self.cfg.get("net_tcp"))
+        dlg = SettingsDialog(self.cfg, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        cfgmod.save(self.cfg)
+        if (self.cfg.get("net_udp"), self.cfg.get("net_tcp")) != old_net:
+            # 端口变了只能重开监听；图传同理，提示用户重启程序
+            self.aux.stop()
+            self.aux = AuxLink(self.cfg)
+            self.aux.start()
+            self._toast("端口已更新", "非图传流已重启，图传端口请重启程序", "info")
+        else:
+            self._toast("设置已保存", "", "good")
 
     def _toggle_fullscreen(self) -> None:
         if self._fullscreen:

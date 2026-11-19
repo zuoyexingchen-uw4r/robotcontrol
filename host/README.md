@@ -24,6 +24,44 @@ ESP32/S3 主控 ──UART── CH343 ──USB-OTG── 小米手机(视觉�
 
 ---
 
+## 1.5 v0.7 新协议（先读这段）
+
+非图传数据不再分 8767/8768/31001/31002 四条通道，改成**一条复用流**：
+
+| 用途 | 传输 | 端口 |
+|---|---|---|
+| 图传视频 | UDP | 47000 |
+| 图传控制（关键帧请求） | TCP | 47000（同号，UDP/TCP 不冲突） |
+| 非图传（雷达 / 主控 / 视觉 / 设置 / 保活） | UDP 好网 / TCP 差网 | 48000 / 49000 |
+
+上位机是**监听方**，手机只出站。协议细节见仓库根 `NETSTACK.md`，
+实现见 `host/netstack/`（`proto / fec / link / ipcfg / pairing`）。
+
+```bash
+python host/netstack/selftest.py     # 38/38，纯逻辑，不开端口
+python host/spaa_host.py             # 控制台
+python host/spaa_host.py --check     # 依赖与端口自检
+```
+
+界面快捷键：
+
+| 键 | 作用 |
+|---|---|
+| `0` | 弹出配对二维码（本机 IP + 视频端口 + 槽位/队伍），手机扫码即连 |
+| `F2` | 设置：IP 模式（RR1/RR2/BR1/BR2/DHCP）、网卡下拉、端口、槽位 |
+
+- 改 IP 走 `netsh`，非管理员会自动弹 UAC 提权；四个地址来自校内赛协议 §2.2
+  （终端 .13/.14/.15/.16）。
+- 二维码内容：`{"v":1,"host":...,"ip":...,"port":47000,"slot":"R1","team":"red","udp":48000,"tcp":49000}`，
+  与 Android `net/Pairing.kt` 对齐，手机只读 `ip/port/slot`。
+- 额外依赖：`qrcode`（出二维码）、`psutil`（枚举网卡）。没装 qrcode 也能跑，只是二维码退化成文本。
+
+> ⚠️ **48000 可能被占用**：Sunshine/Moonlight 默认占用 47989~48010，实测本机 48000
+> 就在 Sunshine 手里（`Get-NetUDPEndpoint -LocalPort 48000`）。启动日志会明确报
+> “绑定失败”，此时在 F2 里换一个端口（如 48050），并同步手机端。
+
+---
+
 ## 2. 文件地图（重点看这些）
 
 | 路径 | 作用 | 状态 |
@@ -134,7 +172,8 @@ HUD 依赖：`PyQt5`、`pygame`、`Pillow`、`imageio-ffmpeg`（ffmpeg 可放 `p
 ## 7. 环境
 
 - Python 3.13（HUD 用 `~/.workbuddy/binaries/python/envs/default`，已装 PyQt5/pygame）。
-- 电脑需监听端口：视频 UDP 46000、图传控制 TCP 47000、串口 TCP 8765、激光 TCP 8767/UDP 8768、切IP UDP 8769。
+- 电脑需监听端口：视频 UDP 47000、图传控制 TCP 47000、非图传 UDP 48000 / TCP 49000。
+  （v0.7 起 8765/8766/8767/8768/31001/31002 全部废弃，见 `NETSTACK.md`）
 - 手机通过 adb 连接（`scripts/laser_recover.sh`、`scripts/switch_ip.sh` 依赖 adb）。
 
 有疑问先看 `LASER_PROTOCOL.md`（激光/主控）和 `PROTOCOL.md`（图传/串口/HUD）。

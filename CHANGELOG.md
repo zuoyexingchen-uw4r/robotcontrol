@@ -3,6 +3,219 @@
 本文档记录 RobotControl（狼牙视觉）的版本变更。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.8.1] — 2026-11-19（端口按规格固定 + 恢复 DHCP + 从视觉码流扫码）
+
+> 面向多机联调：把"手机偷偷开端口"和"扫码要枪相机"两个坑一并堵掉。
+
+### 修复 / 变更
+
+- **端口常量对齐**（`net/NetProto.kt`）：原来写的是 32768/32769/32770，与
+  `NETSTACK.md`、`host/netstack/proto.py`、`host/spaa/config.py` 的
+  **47000 / 48000 / 49000** 不一致 —— 两侧各按自己的常量跑必然不通。
+  现在固定为：图传 47000（视频 UDP 与图传控制 TCP 同号，UDP/TCP 端口空间独立）、
+  非图传 48000（UDP 好网）/ 49000（TCP 差网）。`PORT_BASE` 保留为视频端口别名。
+- **手机零监听复核**：全仓库已无 `ServerSocket`、无固定端口 `bind`；非图传链路只在
+  临时端口上 `bind(0)` 收回包（客户端行为，不是监听服务）。
+- **新增「恢复DHCP」按钮**（`ConsoleViewModel.restoreDhcp` + 控制台 IP 行）：
+  清掉 `Settings.robotIp` 的静态地址记忆，并广播 `switch_ip dhcp` 给
+  `scripts/switch_ip.sh --listen`，由电脑端 adb 摘掉静态地址、重新走 DHCP。
+- **`scripts/switch_ip.sh` 支持 dhcp**：新增 `set_dhcp()`（`dhcptool` → 回退
+  「关/开 WiFi」触发系统重新 DHCP → 复查 `ip -4 addr`），CLI 参数与监听分支都认 `dhcp`。
+- **手机端扫码改为复用视觉码流**（`net/QrFromVision.kt`）：
+  相机被图传会话占着，另开扫码页必然抢不到 camera。改为把视觉第二会话的
+  YUV `planes[0]`（亮度）降采样到最长边 720 后直接喂 ZXing `QRCodeReader`，
+  15fps 流里每 6 帧解一次（≈2.5 次/秒），图传与视觉都不受影响。
+  识别成功 → `Pairing.parse` → 落盘 → 自动关窗；粘贴通道保留为后备。
+- 依赖：新增 `com.google.zxing:core:3.5.3`（纯 Java，无 NDK）。
+
+### 联调前必读
+
+- 电脑先起上位机（占 47000/48000/49000），手机再点「启动图传」；手机全程只出站。
+- 扫码需要视觉码流在跑（图传已启动），因为扫码不另开相机。
+
+## [0.8.0] — 2026-11-18（主控制台重做：Jetpack Compose + M3 浅色）
+
+> 目标：把第一屏从「XML 表单堆叠」换成横屏平板（1280×800dp 基准）的控制台，
+> 每个控件都必须连到真实模块，而不是摆着好看。
+
+### 新增（UI 层，`ui/console` + `ui/theme`）
+
+- `ui/theme/LangyaTheme.kt`：Purple 浅色配色方案（角色名集中定义，界面代码零硬编码
+  色值）、收紧的形状档位、Roboto 排版、`ConsoleMotion`（等价 MotionScheme.standard：
+  300/200/150ms tween，不用 spring，不回弹）。
+- `ui/console/Controls.kt`：按规格调过的标准组件 —— 56dp 中号按钮（外侧圆角 = 半高）、
+  相连按钮组（3dp 间距、内侧圆角 8dp）、56dp 描边输入框（16dp 圆角）、
+  exposed dropdown（菜单 surfaceContainer / 4dp / 项高 48dp）、18dp 复选框、
+  粗轨道滑块（轨道 16dp、手柄 4×44dp、左 primary 右 secondaryContainer）、
+  容器框（surfaceContainerHigh / 28dp）与 1dp 分割线。
+- `ui/console/ConsoleScreen.kt`：屏幕分两层 —— **折叠态**（顶栏 44dp + 日志/预览面板撑满 +
+  底部四键：扫码连接 / 锁定屏幕 / 重新连接 / 展开项目，一屏不滚动）与 **展开态**
+  （面板压到 42% 高，设置行可滚动，第四键变「收起项目」）。
+- `ui/console/ConsoleViewModel.kt`：界面所有动作的落点（见下表）。
+- `MainActivity` 改为 `ComponentActivity` + Compose；旧的 XML 页面
+  （`BridgeActivity` / `VisionSettingsActivity`）保留为二级页。
+
+### 真机验证与修正（ALI-AN00，1200×2652@520dpi → 816×369dp 横屏）
+
+- **布局改成按比例**：宽度一律 weight（日志:预览 = 640:588）、面板高度 = 可用高 × 0.42〜0.46、
+  断点 `maxWidth ≥ 1000dp` 时才用规格的一行排布；手机上 5 个下拉拆 3+2、槽位组独占一行。
+  固定 640dp 会把预览挤成竖排字（真机实测）。
+- **日志面板去掉标题栏**（一眼能看出是日志，省 28dp），清空改为长按日志区。
+- **顶栏压到 44dp**（标题 titleSmall、状态胶囊 labelSmall、图传按钮 38dp）。
+- **预览方向修正**：真机上相机画面转了 90°（圆柱横躺）。TextureView 用 Camera2 官方
+  `configureTransform`（setRectToRect → 等比放大 → 按 displayRotation 旋转 ±90°），
+  现在画面铺满 16:9、内容正立。
+- **预览改挂图传会话**：该机型不支持「720p 编码会话 + 第二路 YUV 会话」并发
+  （第二路卡在 createCaptureSession 无回调），预览改由 `CameraStreamer.Config.previewSurface`
+  承载；第二路只在有视觉开关时启动，并加 4s 看门狗，配不上就关掉。
+- 预览控件从 SurfaceView 换 **TextureView**：SurfaceView 在 Compose 里拿不到
+  `surfaceCreated`（黑屏死框），TextureView 走普通 View 绘制稳定。
+- 预览 buffer 显式 `setDefaultBufferSize(1280, 720)`：直接用 view 尺寸会让 HAL 静默丢流。
+- 有预览时才用 `TEMPLATE_PREVIEW` 请求；无预览仍走原来的 `TEMPLATE_RECORD` 低延迟管线。
+- `Settings.videoPort` 默认值 46000 → **47000**（PROTOCOL.md v0.7 已改端口，代码默认值忘了跟）。
+- IP 输入自动规范化：中文输入法常把 `.` 打成全角「。」，现在全角点/顿号/逗号一律转半角点，
+  并过滤非数字字符。
+- 日志同时镜像到 logcat（`logcat -s LangyaConsole`），现场只连 adb 时不用盯 4 行高的面板。
+- **崩溃修复**：折叠/展开切换会重建 TextureView → 预览 Surface 变化 → 图传 stop/start
+  竞态，`CameraStreamer.onConfigured` 在 device 已关闭时抛
+  `IllegalStateException: CameraDevice was already closed` 直接崩进程。三处一起改：
+  面板放到固定 composition 位置（切换只改高度、不重建视图）；`onConfigured` 先查
+  `running` 并 try/catch 兜住迟到回调；预览 Surface 变化改成 250ms 防抖重启。
+
+### 控件 → 真实对象
+
+| 界面对象 | 接到哪里 |
+|---|---|
+| 日志容器 | 编码器 / USB / 网络 / 视觉日志聚合（300 行，自动贴底，可清空） |
+| 预览容器 | 图传会话的预览 Surface（`Config.previewSurface`），TextureView 输出 |
+| 底部「扫码连接」 | `Pairing.parse` + `Pairing.apply`（对话框贴码，相机被图传占用） |
+| RED_R1… 按钮组 | `RobotSlots` + `Settings.robotId/Ip` + `switch_ip` 广播（8769） |
+| 雷达分包滑块 | `Settings.netBatch`（1/10/20，40% 落在 10 槽） |
+| 串口波特率 / VID / PID | `Settings.laserBaud`、新增 `serialVid`/`serialPid`（`UsbSerialTransport` 按此匹配设备） |
+| 视频分辨率 / 帧率 | `CameraStreamer.caps()` 真实能力 → `Config.width/height/fps` |
+| 传输编码 / 编码器 | `Settings.codecIndex` / `encoderMode` → `EncoderMode` |
+| 纠错模式 | `Settings.fec`（FEC 百分比） |
+| 码率 / 空闲补关键帧 / 画面预览 | `Config.bitrate` / `adaptiveKeyframe` / 预览 Surface |
+| 网络协议层模式 | `Settings.netMode` → `UartLink.Mode`；未选过显示"未选择" |
+| 强制接管串口 | `Settings.serialForceTakeover` + 串口桥重启 |
+| 上行 / 下行 / 延迟 | 编码器 `onStats` + 新增 `UartLink.addStatsListener`（不抢激光桥的 `onStats`） |
+| 电池 / CPU 温度 / 电量 | BatteryManager + `/sys/class/thermal` |
+| 无障碍 / ADB 状态 | AccessibilityManager + `Settings.Global.ADB_ENABLED` |
+| 锁定屏幕 | 新增 `ScreenLockAdmin`（DeviceAdmin，只申请 force-lock） |
+| 重新连接 | 停图传 → 重启串口桥/非图传流 → 再起图传 |
+
+### 变更（后端小改动）
+
+- `VisionUdpLink` 重新接回控制台：视觉结果与设置快照仍走非图传流长帧 JSON
+  （init 时建链路，启动图传/应用连接码后幂等 `start()`），改 UI 不会把视觉上行弄断。
+- `NetCore.configure(udp, tcp)` 由控制台按 `Settings.netUdpPort/netTcpPort` 注入，
+  避免链路先按默认 48000/49000 建起来、改端口只能重启。
+- `UartLink`：新增 `addStatsListener` / `removeStatsListener`（1Hz 并行分发），
+  控制台不再和激光桥抢唯一的 `onStats`。
+- `VisionCamera`：新增 `previewSurface`，预览并入视觉会话，不开第三条会话、
+  不影响图传码流。
+- `UsbSerialTransport`：`vidFilter` / `pidFilter` 可配（0 = 通配），prober 同步登记。
+- `Settings`：新增 `serialVid` / `serialPid` / `serialForceTakeover` / `previewOn` /
+  `netModeChosen`；`adaptiveKf` 默认改为 `true`（界面初始勾选）。
+- 构建：Kotlin 2.2.10 + Compose Compiler 2.2.10、Compose 1.10.4、
+  Material3 1.4.0；`lint.checkReleaseBuilds = false`（AGP 8.7.3 lint 与 K2 前端冲突）。
+
+### 预览改走视觉链路（v0.8 真机迭代）
+
+- **图传会话只保留编码器**：不再把预览 Surface 塞进编码 session（双 target 时 HAL 会走另一条
+  输出路径，推流画面方向变歪）。`TEMPLATE_RECORD` 与项目原低延迟参数不变。
+- **预览改为视觉帧**：`VisionCamera` 的 YUV 帧降采样成 480×270 位图（旋转 90° + 居中裁 16:9），
+  每 3 帧更新一次（≈9fps），只按目标像素采样，CPU 约 0.4ms/帧；界面用 `Image` 直接贴。
+- **两路 session 串行化**：图传 session 稳定后延迟 900ms 再建视觉 session，重建视觉有 400ms 延迟；
+  `setRepeatingRequest` 增加 `IllegalStateException` 兜底（另一条 session 建立时 HAL 会关掉本条，
+  之前会崩进程）。
+- `Settings` 增加一次性端口迁移：老设备 prefs 里残留的 46000 自动改 47000（手填过的端口不动）。
+- **预览方向可调**：预览面板标题行加 ⟳ 角度按钮（0/90/180/270 循环，存 `Settings.previewRotation`）。
+  真机实测本机 **0°** 就是正的（之前误判为需要旋转 90°，是因为早先 TextureView 的变换算错导致的）。
+  换机型或换摄像头安装方向时点按钮即可，不必改代码重装。
+
+### 文档
+
+- 新增 `JOINT_DEBUG.md`：上下位机联调指南 —— 端口表、启动顺序、手机/电脑两侧准备、
+  S1~S6 分步联调（串口 → 图传 → 非图传流 → 视觉上行 → 开火 → 弱网）、验收清单、
+  排障 FAQ（黑屏/方向/收不到流/端口占用/USB 识别）、抓日志与协议速查。
+
+### 已知限制
+
+- material3 **1.4.0** 的 `MaterialExpressiveTheme` / `MotionScheme` 是 `internal`，
+  1.5.0 又要求 compileSdk 37（本机 AGP 8.7.3 上限 35/36），因此按
+  MotionScheme.standard 的数值用 `ConsoleMotion` 落地；组件尺寸/形状按 expressive
+  规格手工装配（ButtonGroup 在 1.4.0 里也没有公开 API）。
+- **推流画面的方向仍是 sensor 原始方向**（侧躺 90°）：本地预览已经旋转修正，
+  但 H.264 码流是编码器直接吃相机 Surface，Camera2 不支持旋转输出。要正过来需要
+  在编码前插一层 GL 旋转，或由上位机（pc_hud / spaa）解码后旋转 90° 显示。
+- 扫码入口仍是"贴码"：相机被图传占用，接 ZXing/CameraX 需要先做相机复用。
+- 该机型不支持双相机会话并发，视觉分析（第二路 YUV）与图传同时开时会自动降级。
+
+## [0.7.1] — 2026-11-19（图传端口对齐 + 上位机解码改为探测）
+
+> 症状：手机上把「图传端口」改成 48000，控制通道却一直往 47000 连，且没有画面。
+
+### 修复
+
+- **控制端口跟随图传端口**：`ConsoleViewModel` 原来 `controlPort = settings.controlPort`
+  （固定 47000，输入框改不到），导致视频发 48000、控制连 47000。现在两者同号。
+- **端口自愈**：`Settings` 启动时把 46000 迁移到 47000；视频/控制不一致自动同步；
+  图传端口撞上非图传端口（48000/49000）退回 47000。
+- **UI 校验**：端口等于非图传端口时输入框标红，启动时直接拒绝并提示，不再“假装在跑”。
+
+### 上位机（SPAA）
+
+- `decoder.py` 改为**先探测码流再解码**：用 `ffprobe` 从 SPS 读出 `codec/width/height/fps`，
+  再按真实参数起 ffmpeg。配置里的 H.264/HEVC 选错、分辨率写错都不再导致黑屏，
+  也不再白做一次缩放。
+- 探测失败（一直没等到 SPS）4 秒后按配置兜底；老版 ffmpeg 不认 `-fps_mode` 自动退 `-vsync 0`。
+- 视图/HUD 跟随探测结果：`video_rect`、纹理上传、`CameraModel`（测距环）都按真实分辨率重建。
+- 3 秒收不到视频包时打印明确提示（端口/推流状态），避免只看到 `SS_RFI_REQUEST` 却无从排查。
+- `--check` 增加 ffprobe 检查。
+
+## [0.7.0] — 2026-11-18（非图传网络栈重构：只剩两条信号）
+
+> 目标：把「图传」之外的所有通道收成**一条流**。旧版同时跑 TCP 8765 / 8766 / 8767、
+> UDP 8768 / 31001 / 31002、WLAN 8888 共八条，四套 socket 生命周期各写一遍，
+> 端口常量散在六个文件、文档与实现已经漂移（文档写 31000，代码 46000）。
+> 协议细节见 `NETSTACK.md`。
+
+### 新增 `net/` 包
+
+- `NetProto`：端口、槽帧头、flags、CRC16 统一到一处
+- `PacketCodec`：16B 包头（magic/ver/flags/seq/blockId/shardStart/count/ts/payloadLen/crc16）
+- `FecBlock`：5 数据槽 + 1 校验槽（20%），单擦除恢复；校验槽强制单独成包
+- `UartSlot`：60B 槽构造与解析、KEEP_ALIVE、本机操作、原始字节分片
+- `UartSlotFramer`：USB 字节流 → 60B 槽；主控帧 39B 补零，**兼容固件改成 60B**
+- `UartLink`：单流复用（攒包滑杆 1/10/20、控制重放 0/1/2、KA、UDP⇄TCP 自适应、统计）
+- `NetCore`：进程级单例 + 引用计数 + JSON 分发 + USB 写入入口
+- `Pairing`：扫码配对编解码（HOST / IP / PORT / 槽位），**扫描入口未接**
+
+### 变更
+
+- `LaserBridge` 只保留 USB 读写与断线重连，网络部分交给 `UartLink`；
+  下行不再有独立「主控下行」通道，PC 直接发 `FA 5B` 原始字节槽
+- `VisionUdpLink` 改为长帧 JSON 走非图传流，JSON 字段不变（上位机解析代码可沿用）；
+  不再 bind 31002、不再广播 31001
+- 图传端口 46000 → **47000**，图传控制继续用 TCP 47000（UDP/TCP 端口空间独立）
+- `Settings` 新增 `netBatch` / `netReplay` / `netMode` / `netUdpPort` / `netTcpPort`
+- 视觉开火优先走 `NetCore.uartWriter`（USB 持有者），避免再开 Transport 抢设备
+- 停图传不再关闭视觉同步链路（旧实现 `stopVideo()` 里 stop 之后再也不重启）
+
+### 删除 / 废弃
+
+- UDP 8768、TCP 8767：并入非图传流；`LaserFecEncoder` 仅保留给自测
+- TCP 8766（数据流 2）：删除
+- 视觉 UDP 31001 / 31002：不再使用
+- `SerialBridge` / `DataBridge` / `TcpChannel`：保留编译，**不要与新链路同时启动**，UI 更新后移除
+
+### 待办
+
+- 上位机按 `NETSTACK.md` §10 补齐：解包 / FEC 解码 / **KA 回显** / 去重 / 长帧重组
+- UI：攒包滑杆、重放滑杆、UDP/TCP 模式开关、扫码入口
+- USB 所有权统一到 `NetCore`（`MainViewModel` 仍会开机抢 CH343）
+
 ## [0.6.0] — 2026-11-08（数学基础驱动的视觉改进）
 
 > 依据《传统视觉与深度学习视觉的数学基础》讲义（62 页）逐节落实：

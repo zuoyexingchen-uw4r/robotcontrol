@@ -1,0 +1,8 @@
+# 上位机（host/）运行依赖
+# ffmpeg 单独装，或把二进制放到 host/bin/ffmpeg.exe
+PyQt5>=5.15
+PyOpenGL>=3.1
+qrcode>=7.4
+psutil>=5.9
+Pillow>=9.0
+numpy>=1.24

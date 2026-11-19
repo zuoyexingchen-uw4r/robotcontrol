@@ -893,6 +893,11 @@ class SpaaHud:
         elif st.get("stats_video", {}).get("connected") is False:
             msgs.append(("视频中断", self.c_crit))
 
+        # 解码器报错（选错编码/找不到 SPS/ffmpeg 退出）直接显示，别让人盯着黑屏猜
+        derr = (st.get("stats_dec") or {}).get("err") or ""
+        if derr:
+            msgs.append((f"解码异常：{derr[:28]}", self.c_crit))
+
         m = st.get("master")
         if m and st.get("master_age", 9e9) < 2.0:
             if m.get("status", 0) & 0x01:

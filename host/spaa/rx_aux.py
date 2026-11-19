@@ -1,33 +1,25 @@
-"""spaa.rx_aux — 雷达点云、主控遥测、手机视觉结果。
+"""spaa.rx_aux — 雷达点云 / 主控遥测 / 视觉结果 / 设置快照（非图传流）。
 
-三条数据都只读不写，统一由 AuxLink 线程收，界面按快照取：
-- 激光/主控：UDP 8768，`[block_id][shard_idx][shard 64B]` + RS-FEC
-  shard = `[type][frame][pad]`，0x01 主控上行 / 0x03 雷达
-- 主控帧：`AA 55 | type | seq(2 LE) | 16×int16 LE | crc16(2 LE)` = 39B
+v0.7 起不再自己开 8768 / 31001 两个 socket，统一走 `netstack.NetLink`：
+本机监听 UDP 48000 + TCP 49000，手机主动连；一条流里按 60B 槽的帧头分流。
+
 - 雷达帧：`55 AA` + 60B，16 点 × (距离 u16 mm + 强度 u8)
-- 视觉结果：UDP 31001 JSON（`{t:"vision", targets:[], track:{}, ...}`）
+- 主控帧：`AA 55 | type | seq(2 LE) | 16×int16 LE | crc16(2 LE)` = 39B（槽里补零到 60B）
+- 视觉结果 / 设置快照：长帧 JSON，`{t:"vision"|"settings", ...}`
 
-下行（TCP 8767）先留接口：主控字段语义还没和电控定稿，发之前不要瞎填。
+界面只读 `snapshot()`，所有解析都在收包线程完成。
 """
 from __future__ import annotations
 
-import json
-import socket
 import struct
 import threading
 import time
 
-from .fec import rs_erasures_decode
+from netstack.link import NetLink
+from netstack.proto import H_LIDAR, H_MCU_UP
 
-T_MASTER_UP = 0x01
-T_MASTER_DOWN = 0x02
-T_LIDAR = 0x03
-
-LIDAR_FRAME_LEN = 60
 MASTER_FRAME_LEN = 39
-SHARD_SIZE = 64
-FEC_K = 8
-FEC_M = 4
+LIDAR_FRAME_LEN = 60
 
 LIDAR_HDR = b"\x55\xaa"
 MASTER_HDR = b"\xaa\x55"
@@ -96,44 +88,12 @@ def parse_lidar(frame: bytes) -> list[tuple[float, int, int]]:
     return pts
 
 
-class _FecBlocks:
-    """按 block_id 攒分片，够 k 个就擦除解码。"""
-
-    def __init__(self, k: int = FEC_K):
-        self.k = k
-        self.blocks: dict[int, dict[int, bytes]] = {}
-        self.unrecoverable = 0
-
-    def feed(self, block_id: int, idx: int, shard: bytes):
-        b = self.blocks.setdefault(block_id, {})
-        b.setdefault(idx, shard)
-        if len(b) < self.k:
-            return None
-        rec = rs_erasures_decode(b, self.k)
-        b.update(rec)
-        frames = []
-        for i in range(self.k):
-            sh = b.get(i)
-            if sh is None:
-                continue
-            t = sh[0]
-            if t == T_LIDAR:
-                frames.append((t, sh[1:1 + LIDAR_FRAME_LEN]))
-            elif t == T_MASTER_UP:
-                frames.append((t, sh[1:1 + MASTER_FRAME_LEN]))
-        self.blocks.pop(block_id, None)
-        if len(frames) < self.k:
-            self.unrecoverable += 1
-        return frames
-
-
 class AuxLink:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.running = False
-        self._socks: list[socket.socket] = []
-        self._threads: list[threading.Thread] = []
+        self.net: NetLink | None = None
         self._lock = threading.Lock()
 
         self.points: list[tuple[float, int, int]] = []
@@ -150,129 +110,76 @@ class AuxLink:
         self.vision_count = 0
 
         self.lidar_frames = 0
-        self.fec_recovered = 0
-        self.fec_failed = 0
         self.err = ""
+        self.net_stats: dict = {}
 
     # ─────────── 启停 ───────────
 
     def start(self) -> None:
         if self.running:
             return
+        if not self.cfg.get("net_enable", True):
+            return
         self.running = True
-        if self.cfg.get("laser_enable", True):
-            self._spawn(self._laser_loop, "aux-laser")
-        if self.cfg.get("vision_enable", True):
-            self._spawn(self._vision_loop, "aux-vision")
-
-    def _spawn(self, fn, name: str) -> None:
-        t = threading.Thread(target=fn, name=name, daemon=True)
-        t.start()
-        self._threads.append(t)
+        self.net = NetLink(
+            self.cfg,
+            on_slot=self._on_slot,
+            on_json=self._on_json,
+            on_stats=self._on_net_stats,
+            log=lambda msg: None,
+        )
+        self.net.start()
 
     def stop(self) -> None:
         self.running = False
-        for s in self._socks:
-            try:
-                s.close()
-            except OSError:
-                pass
+        if self.net:
+            self.net.stop()
+            self.net = None
 
-    # ─────────── 激光 + 主控 ───────────
+    # ─────────── 槽 → 业务 ───────────
 
-    def _laser_loop(self) -> None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        except OSError:
-            pass
-        s.settimeout(0.5)
-        try:
-            s.bind(("0.0.0.0", int(self.cfg["laser_udp"])))
-        except OSError as e:
-            self.err = f"激光端口 {self.cfg['laser_udp']} 绑定失败：{e}"
+    def _on_slot(self, header: int, slot: bytes) -> None:
+        if header == H_LIDAR:
+            pts = parse_lidar(slot)
+            if not pts:
+                return
+            with self._lock:
+                self.points = pts
+                self.points_t = time.time()
+                self.speed_rpm = struct.unpack_from("<H", slot, 4)[0]
+                self.lidar_frames += 1
             return
-        self._socks.append(s)
-        fec = _FecBlocks()
 
-        while self.running:
-            try:
-                data, _ = s.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if len(data) != SHARD_SIZE + 2:
-                continue
-            frames = fec.feed(data[0], data[1], data[2:])
-            if not frames:
-                continue
-            for t, frame in frames:
-                if t == T_LIDAR:
-                    pts = parse_lidar(frame)
-                    if pts:
-                        with self._lock:
-                            self.points = pts
-                            self.points_t = time.time()
-                            self.speed_rpm = struct.unpack_from("<H", frame, 4)[0]
-                            self.lidar_frames += 1
-                elif t == T_MASTER_UP:
-                    r = parse_master(frame)
-                    if r is None:
-                        continue
-                    _mtype, seq, fields = r
-                    with self._lock:
-                        if self.master_seq >= 0:
-                            d = (seq - self.master_seq) & 0xFFFF
-                            if d > 1:
-                                self.master_lost += d - 1
-                        self.master_seq = seq
-                        self.master = dict(zip(UP_FIELD_NAMES, fields))
-                        self.master_t = time.time()
-        try:
-            s.close()
-        except OSError:
-            pass
+        if header == H_MCU_UP:
+            r = parse_master(slot[:MASTER_FRAME_LEN])
+            if r is None:
+                return
+            _mtype, seq, fields = r
+            with self._lock:
+                if self.master_seq >= 0:
+                    d = (seq - self.master_seq) & 0xFFFF
+                    if d > 1:
+                        self.master_lost += d - 1
+                self.master_seq = seq
+                self.master = dict(zip(UP_FIELD_NAMES, fields))
+                self.master_t = time.time()
 
-    # ─────────── 视觉结果 ───────────
-
-    def _vision_loop(self) -> None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        except OSError:
-            pass
-        s.settimeout(0.5)
-        try:
-            s.bind(("0.0.0.0", int(self.cfg["vision_port"])))
-        except OSError as e:
-            self.err = f"视觉端口 {self.cfg['vision_port']} 绑定失败：{e}"
-            return
-        self._socks.append(s)
-
-        while self.running:
-            try:
-                data, _ = s.recvfrom(16384)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                msg = json.loads(data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(msg, dict) or msg.get("t") != "vision":
-                continue
+    def _on_json(self, msg: dict) -> None:
+        if msg.get("t") == "vision":
             with self._lock:
                 self.vision = msg
                 self.vision_t = time.time()
                 self.vision_count += 1
-        try:
-            s.close()
-        except OSError:
-            pass
+
+    def _on_net_stats(self, st: dict) -> None:
+        self.net_stats = st
+        if st.get("err"):
+            self.err = st["err"]
+
+    # ─────────── 下行（留给操控链路） ───────────
+
+    def send_uart(self, data: bytes) -> bool:
+        return bool(self.net and self.net.send_uart(data))
 
     # ─────────── 快照 ───────────
 
@@ -290,5 +197,7 @@ class AuxLink:
                 "vision_age": now - self.vision_t if self.vision_t else 1e9,
                 "vision_count": self.vision_count,
                 "lidar_frames": self.lidar_frames,
+                "net": dict(self.net_stats),
+                "settings": (self.net.settings if self.net else None),
                 "err": self.err,
             }

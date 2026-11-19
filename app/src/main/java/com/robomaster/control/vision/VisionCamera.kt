@@ -35,7 +35,16 @@ class VisionCamera(
     private val height: Int,
     private val fps: Int = 15,
     private val handler: Handler,
+    /**
+     * 小窗预览用的 Surface（可选）。
+     *
+     * 控制台的要求是「预览第二路码流」：这一路就是视觉会话，把 SurfaceView 的
+     * Surface 加进同一个 session 即可，不需要再开第三条会话，也不会影响图传码流。
+     */
+    private val previewSurface: Surface? = null,
     private val onFrame: (Image) -> Unit,
+    /** 会话真正就绪（repeating request 已提交）时回调，用于取消调用方的看门狗 */
+    private val onReady: () -> Unit = {},
     private val onError: (String) -> Unit = {}
 ) {
     private var reader: ImageReader? = null
@@ -64,9 +73,13 @@ class VisionCamera(
                 }
             }, handler)
 
+            val pv = previewSurface?.takeIf { it.isValid }
+            val targets = arrayListOf<Surface>(reader!!.surface)
+            if (pv != null) targets.add(pv)
+
             @Suppress("DEPRECATION")
             device.createCaptureSession(
-                listOf<Surface>(reader!!.surface),
+                targets,
                 object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: android.hardware.camera2.CameraCaptureSession) {
                         val currentReader = reader
@@ -78,12 +91,14 @@ class VisionCamera(
                             session = s
                             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(currentReader.surface)
+                                if (pv != null) addTarget(pv)
                                 // 独立帧率：视觉分析可跑低于图传的帧率，减轻 CPU 负担
                                 set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
                                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                             }.build()
                             s.setRepeatingRequest(req, null, handler)
-                            Log.i(TAG, "视觉第二会话就绪 ${width}x${height}@${fps}")
+                            Log.i(TAG, "视觉第二会话就绪 ${width}x${height}@${fps}" + if (pv != null) "（含预览）" else "")
+                            onReady()
                         } catch (e: Exception) {
                             stop()
                             onError("视觉会话启动失败: ${e.message}")

@@ -14,24 +14,29 @@ CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".spaa")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# 配置结构版本：2 = 非图传流（47000/48000/49000）。旧配置读进来会强制迁移端口。
+CONFIG_VERSION = 2
+
 DEFAULTS: dict = {
+    "config_version": CONFIG_VERSION,
     # ── 图传（手机 CameraStreamer → 本机）──
-    "video_port": 46000,          # UDP 视频
+    "video_port": 47000,          # UDP 视频（与图传控制同号，UDP/TCP 不冲突）
     "ctrl_port": 47000,           # TCP 关键帧请求（本机监听）
     "codec": "h264",              # h264 | hevc
     "decode_w": 1280,             # 解码输出尺寸（与手机推流一致最省）
     "decode_h": 720,
     "hwaccel": "auto",            # auto | d3d11va | none
     "ffmpeg_path": "ffmpeg",      # 可用 ~/.spaa/config.json 覆盖
+    "ffprobe_path": "",           # 空 = 用 ffmpeg 同目录的 ffprobe（探测码流参数）
 
-    # ── 激光雷达 / 主控 ──
-    "laser_udp": 8768,
-    "laser_tcp": 8767,
-    "laser_enable": True,
-
-    # ── 手机视觉结果（UDP 广播）──
-    "vision_port": 31001,
-    "vision_enable": True,
+    # ── 非图传流（雷达 / 主控 / 视觉 / 设置 / 保活）──
+    "net_enable": True,
+    "net_udp": 48000,             # 手机 → 本机
+    "net_tcp": 49000,             # TCP 备份（常连，差网切换）
+    # 赛事终端地址模式：RR1/RR2/BR1/BR2/DHCP，见 netstack/ipcfg.py
+    "ip_mode": "RR1",
+    "adapter": "",                # 网卡名，留空 = 不自动切
+    "slot": "R1",                 # R1/R2/B1/B2，扫码时告诉手机自己是哪个槽位
 
     # ── 相机标定（测距环用）──
     "camera": {
@@ -121,6 +126,7 @@ def _local_ffmpeg() -> str:
 
 def load() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))       # 深拷贝
+    user: dict = {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             user = json.load(f)
@@ -131,6 +137,13 @@ def load() -> dict:
                 cfg[k] = v
     except (OSError, json.JSONDecodeError):
         pass
+
+    # 旧配置迁移：v1 的 46000/8768/31001 那套端口已经不存在了。
+    # 只覆盖端口，别动用户的分辨率、标定、键位。
+    if int(user.get("config_version", 1) or 1) < CONFIG_VERSION:
+        for k in ("video_port", "ctrl_port", "net_udp", "net_tcp"):
+            cfg[k] = DEFAULTS[k]
+    cfg["config_version"] = CONFIG_VERSION
 
     ff = cfg.get("ffmpeg_path", "ffmpeg")
     if not (os.path.isabs(ff) and os.path.exists(ff)) and shutil.which(ff) is None:

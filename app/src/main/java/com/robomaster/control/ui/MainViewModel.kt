@@ -90,6 +90,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * （开火指令延迟敏感，不走网络）。帧格式见 FireController.serialize。
      */
     fun sendVisionCommand(bytes: ByteArray) {
+        // 优先走 USB 持有者（激光桥）的写入入口：设备是独占的，本 ViewModel 另开一个
+        // Transport 会抢不到端口。没接桥时退回自己的通道，保持旧行为。
+        val writer = com.robomaster.control.net.NetCore.uartWriter
+        if (writer != null) {
+            writer(bytes)
+            return
+        }
         viewModelScope.launch {
             if (usb.state.value is ConnState.Connected) {
                 usb.send(bytes)
