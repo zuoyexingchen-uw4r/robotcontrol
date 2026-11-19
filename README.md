@@ -11,9 +11,10 @@
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
+| 主控制台（Compose + M3 浅色手机 UI） | ✅ v0.8 | 手机横屏；折叠态看日志+预览，展开态调参数，底部四键（扫码/锁屏/重连/展开） |
 | 图传（Camera2 硬编 + GameStream 推流） | ✅ 已实现 | 电脑监听、手机连接，FEC 前向纠错 |
 | 串口桥接（CH343 USB-OTG） | ✅ 已实现 | 与下位机（ESP32-S3）通信 |
-| 视觉设置界面 | ✅ 已实现 | 各功能开关 + 状态栏避让 |
+| 视觉设置界面 | ✅ 已实现 | 二级页；各功能开关 + 状态栏避让 |
 | 图像预处理 | ✅ 已实现 | 去模糊（维纳反卷积）/ 平滑（双边滤波）/ 去辉光 |
 | 目标检测 | ✅ 框架已实现 | 高地靶（绿）/ 基地靶（红），HSV→形态学→连通域→几何分析 |
 | 目标追踪 | ✅ 框架已实现 | 卡尔曼 CV 滤波 |
@@ -66,10 +67,16 @@ Camera2（同一 CameraDevice，两条独立会话）
 
 ```
 app/src/main/java/com/robomaster/control/
-├── ui/                  # 界面（MainActivity / BridgeActivity / VisionSettingsActivity）
+├── ui/                  # 界面
+│   ├── MainActivity.kt        # 第一屏：Compose 控制台宿主（横屏平板）
+│   ├── console/               #   控制台：ConsoleScreen / ConsoleViewModel / Controls
+│   ├── theme/                #   浅色 M3 配色、形状、排版、ConsoleMotion
+│   └── BridgeActivity / VisionSettingsActivity  # 二级页（XML 视图）
 ├── video/               # 图传（CameraStreamer / GameStreamSender / ReedSolomon）
-├── bridge/              # 桥接（TcpChannel / SerialBridge / DataBridge）
+├── bridge/              # 桥接（TcpChannel / SerialBridge / DataBridge）※旧通道，待随 UI 移除
 ├── comm/                # 通信协议（帧解析 / 状态机）
+├── net/                 # 非图传网络栈 v1（60B 槽 / 16B 包头 / 5+1 FEC / 双承载 / 配对）
+│                        # 见 NETSTACK.md；LaserBridge 与视觉上行都走这里
 ├── vision/              # 视觉（本次新增）
 │   ├── VisionPipeline.kt      # 主管线
 │   ├── VisionCamera.kt        # 独立第二会话（ImageReader + 帧回调 + YUV→RGB）
@@ -89,10 +96,19 @@ app/src/main/java/com/robomaster/control/
 ## 4. 构建与运行
 
 ```bash
-# 本机已配 Gradle + SDK
-gradle assembleDebug
+# 调试包
+./gradlew assembleDebug
 # APK: app/build/outputs/apk/debug/app-debug.apk
+
+# 已签名 release 包（交付物）
+./gradlew assembleRelease
+# APK: app/build/outputs/apk/release/app-release.apk
+# 签名：keystore/langya-release.jks（alias=langya，口令在 gradle.properties，
+#      自签 RSA2048/30 年，仅供本机与局域网设备安装）
 ```
+
+> v0.8 起 Kotlin 2.2.10 + Compose 1.10.4 + Material3 1.4.0；release 打包跳过
+> `lintVital`（AGP 8.7.3 的 lint 分析器与 K2 前端不兼容，会误报崩溃）。
 
 自测（纯 Kotlin，无 Android 依赖；用 Android Studio 自带 kotlinc 即可）：
 
@@ -133,8 +149,9 @@ java -jar st_math.jar                      # 期望 49/49
   接入后按 §1.7 逆方差加权生效，无需改调用点
 - 亚像素精定位依赖边缘对比度（阈值 20 灰阶），强逆光/严重失焦时
   自动回退整数矩形（不变差，也不变准）
-- 视觉结果 UDP 31001 发送端已实现（v0.6.1，`vision/VisionUdpLink.kt`）；
-  视频链路、设置双向同步（31002）均已打通
+- 视觉结果与设置同步已并入**非图传流**（v0.7）：一条 UDP 48000 / TCP 49000 的复用流，
+  长帧 JSON 发送；旧 UDP 31001 / 31002 广播已不再使用
+- 非图传流的上位机侧尚未实现，联调前按 `NETSTACK.md` §10 补齐解包 / FEC 解码 / KA 回显
 - 导航待机械组完成机器人框架
 
 ## 6.1 版本 0.6.0 的数学依据索引
@@ -154,5 +171,8 @@ java -jar st_math.jar                      # 期望 49/49
 
 ## 7. 协议文档
 
+- `JOINT_DEBUG.md`：**上下位机联调指南**（端口表 / 启动顺序 / 分步联调 / 排障 / 验收清单）
+- `NETSTACK.md`：非图传流 v1（60B 槽 / 16B 包头 / 5+1 FEC / 控制重放 / KA / UDP⇄TCP）
 - `PROTOCOL.md`：图传/桥接/串口协议
+- `LASER_PROTOCOL.md`：激光+主控混合流（v3 起已并入 `NETSTACK.md`）
 - `CHANGELOG.md`：版本变更记录

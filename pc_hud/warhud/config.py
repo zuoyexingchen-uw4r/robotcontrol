@@ -13,10 +13,10 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 DEFAULTS = {
     # 视频流（手机 CameraStreamer 推送目标 = 本机）
     "video_ip": "0.0.0.0",        # 监听地址（0.0.0.0 = 本机所有网卡）
-    "video_port": 31000,
-    "codec": "h264",              # h264 | hevc
-    "decode_w": 1280,
-    "decode_h": 720,
+    "video_port": 48000,
+    "codec": "hevc",              # h264 | hevc
+    "decode_w": 1920,
+    "decode_h": 1080,
 
     # ffmpeg 可执行文件（PATH 找不到时在此填绝对路径；
     # 也可放到 pc_hud/bin/ffmpeg.exe，load() 会自动优先使用）

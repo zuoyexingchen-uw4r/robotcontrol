@@ -1,5 +1,9 @@
 # RobotControl 无线桥接 / 图传协议（v2 — GameStream 兼容）
 
+> ⚠️ **2026-11 起（v0.7）**：本文档描述的 TCP 8765 / 8766 / 8767、UDP 8768、
+> UDP 31001 / 31002 五条通道已被**非图传流**取代，见 `NETSTACK.md`。
+> 图传部分（视频 UDP 47000 + 控制 TCP 47000）仍然有效，端口由 46000 改为 47000。
+
 > 手机固定于机器人，作为无线桥：把 OTG-CH343 串口 与 摄像头 H.264/HEVC 视频 低延迟送到电脑。
 > 电脑与手机需在同一局域网（手机可开热点，电脑连之）。
 > v2 起视频部分改用 **Sunshine/Moonlight GameStream 包格式**（RTP + NV_VIDEO_PACKET + Reed-Solomon FEC + pacing 限速），
